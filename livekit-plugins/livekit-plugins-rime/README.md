@@ -123,3 +123,216 @@ The v1 implementation has these limits:
 - The adapter reuses WebSocket connections between sequential LiveKit streams. It does not run
   concurrent contexts on one WebSocket. Concurrent LiveKit streams use separate pooled
   WebSocket connections.
+
+## Prism realtime
+
+Prism provides speech input, reasoning, tool calls, and speech output through the
+Python Rime SDK. Use Python 3.11 or later. TTS still supports Python 3.10.
+
+```sh
+uv pip install 'livekit-plugins-rime[realtime]'
+```
+
+The realtime extra requires `rimelabs-sdk>=0.1.0a24`. For source development:
+
+```sh
+uv sync --package livekit-plugins-rime --extra realtime --inexact
+```
+
+```python
+from livekit.agents import Agent, AgentSession
+from livekit.plugins import rime
+from rimelabs_sdk.realtime import TurnDetection
+
+model = rime.realtime.RealtimeModel(
+    turn_detection=TurnDetection(eagerness="low", end_of_turn_timeout_ms=5000),
+)
+session = AgentSession(llm=model)
+await session.start(agent=Agent(instructions="Give short, clear answers."), room=ctx.room)
+session.generate_reply(user_input="Hello!")
+```
+
+Set `RIME_API_KEY`. The default endpoint is `wss://prism.api.rime.ai/v1/realtime`.
+Use `endpoint=` for a custom deployment and `voice=` if it has no default voice.
+The endpoint must accept the SDK's Bearer API-key handshake. Local endpoints can
+use `ws://localhost/...`. An injected `client=Rime(...)` remains caller-owned.
+Create one model per AgentSession and close it when the application finishes.
+
+Use the ordinary `livekit.agents.AgentSession` and
+`livekit.agents.llm.RealtimeModelFallbackAdapter`. The plugin has no replacement
+session, activity, fallback class, or custom audio output.
+
+```python
+from livekit.agents.llm import RealtimeModelFallbackAdapter
+
+model = RealtimeModelFallbackAdapter([
+    rime.realtime.RealtimeModel(),
+    rime.realtime.RealtimeModel(),
+])
+session = AgentSession(llm=model)
+```
+
+### LiveKit compatibility
+
+Prism targets LiveKit's standard realtime interface from 1.7.1 onward. We test
+1.7.1, 1.8.6, and 1.8.8 with `rimelabs-sdk==0.1.0a24`. The package now requires
+`livekit-agents>=1.8.9`; installation on older versions needs a release that permits it.
+
+LiveKit 1.7.1 fixes active-response cancellation through `SpeechHandle.interrupt()`.
+Versions 1.7.1 through 1.8.5 still ignore realtime `max_tool_steps`, including for
+OpenAI. Use [1.8.6 or later](https://github.com/livekit/agents/pull/7555) if you need
+that limit. Explicit `tool_choice="none"` works on 1.7.1.
+
+Run the source compatibility check from the repository root:
+
+```sh
+uv run --no-project --python 3.11 \
+  --with 'livekit-agents[codecs]==1.7.1' \
+  scripts/test_rime_compatibility.py --core-version 1.7.1
+```
+
+Substitute both version values to test another release. The runner verifies import
+paths and runs all Rime regressions locally without API keys. Three tool-limit
+cases are expected failures before 1.8.6; other failures or skips fail the check.
+Package installation and live services need separate validation.
+
+### Turns and interruption
+
+Microphone input uses Prism's server turn detection. The adapter forwards
+speech events and uses LiveKit's standard cancellation and message truncation.
+It requests interruption on caller speech. Early speech hints do not change
+playback volume. There is no custom per-response interruption policy.
+
+The adapter sends no playback completion receipts. Prism estimates playback
+completion from its audio timing plus 1.5 seconds of slack. After caller
+interruption it waits up to 300 ms for a precise position, then uses its estimate.
+Skipped or muted output can therefore delay the next request until the estimate
+expires. LiveKit supplies a truncation position when it interrupts a partially
+played message, including application stops.
+
+Text passed to `generate_reply(user_input=...)` is inserted into history before
+a proactive reply request. It is not submitted through Prism's dedicated typed
+turn operation. The response can use that history but does not identify the text
+as its current input item. Per-reply instructions can accompany this request.
+
+### Tools and settings
+
+Tools execute through LiveKit. The adapter submits each result and requests a
+tool continuation. Completed tool history can be loaded into a fresh session;
+resuming a pending tool call in a new session is unsupported.
+
+`tool_choice="auto"` uses the registered tools. `tool_choice="none"` is emulated:
+the adapter clears the server's tools, waits for acknowledgment, requests the
+reply, then restores the tools after response creation. A cancelled request must
+settle before restoration. An unexpected tool call from a suppressed response
+fails the session before LiveKit can execute it. A failed restoration also fails
+the session because its configuration is uncertain.
+
+These operations are not atomic. An automatic speech response that starts during
+the temporary change can also receive no tools. This applies at LiveKit's tool-step
+limit and during handoff when LiveKit requests a final reply without tools.
+When Prism supplies a settings revision, each response keeps the tool policy of
+that revision, even if it arrives after a later settings update.
+Required or named tool choices remain unsupported. The plugin does not advertise
+native per-response tool selection.
+
+Use `agent.update_instructions()` and `agent.update_tools()` for agent settings.
+Updates wait for Prism acknowledgments. Handoff uses the normal LiveKit sequence;
+instructions, history, and tools are separate updates. There is no atomic handoff.
+Use `await model.update_session(voice="...")` for the voice or
+`await model.update_session(response_metadata={"step": "2"})` for response labels.
+`model.session_info` reports acknowledged settings and the provider request ID.
+When one call changes both settings and response labels, it sends two separate
+requests. If the label update fails, the earlier accepted settings remain applied
+and are reflected in `model.session_info`.
+
+Tool fillers are optional. Pass
+`tool_fillers={"lookup": PrismFiller(type="text", text="Checking your order.")}`,
+with `PrismFiller` imported from `rimelabs_sdk.realtime`. The keys must name
+registered tools. Use `type="none"` to suppress filler or `type="auto"` for generated
+filler. Change them with `model.update_session(tool_fillers=...)`.
+
+### History and recovery
+
+`agent.update_chat_ctx()` supports user, assistant, and system text messages and
+completed tool calls/results. Each imported message has at most 4000 characters.
+An imported result must immediately follow its call. Images, video, developer
+messages, and tool progress are unsupported. LiveKit configuration and handoff
+records stay local. Importing history does not execute tools or start a reply.
+
+Append and deletion preserve retained turns. Replacing or reordering history
+rebuilds completed items with new server IDs. A rebuild requires no active reply
+or pending tool call. Prism has no atomic history replacement: replies can see
+intermediate context between operations. A failure after partial application
+ends the session. Standard fallback replays the current agent context, which can
+already contain the requested edit even when Prism rejected it.
+`await model.get_history()` returns completed server items. Running replies may
+be absent from that snapshot.
+
+Set `truncation="auto"`, `truncation="disabled"`, or
+`truncation=RetentionRatio(0.9)` at construction or through `model.update_session()`.
+Import `RetentionRatio` from `rimelabs_sdk.realtime`. Automatic truncation retains
+0.8 of the available history capacity. Disabling it reports an error when the
+context no longer fits. This setting requires deployment support and does not
+erase the conversation record. Omit it for older deployments.
+
+The SDK and adapter do not automatically reconnect or replay accepted requests.
+Standard LiveKit fallback can restart with supported history. It cannot restore
+an active tool round. Set `regenerate_on_swap=False` when an automatic replacement
+reply is unwanted. Text input submitted again is another history insertion.
+Unknown request outcomes fail the SDK session; they are not retried.
+
+This plugin uses unchanged LiveKit core. Core records requested agent history
+before the provider acknowledges it, so rejected or cancelled edits can leave
+agent and provider history different. Fallback startup can also return before a
+backup is ready, and a failed restart can emit more than one reconnect event.
+Use a known valid history when starting a replacement session after these errors;
+the plugin does not add its own history rollback or startup failover logic.
+
+### Events and limits
+
+The model emits `session_updated`, `generation_created`, and `speech_stopped`.
+`PrismGenerationCreatedEvent` includes response labels, input item IDs when
+provided, the settings revision, and the provider request ID.
+`PrismSpeechStoppedEvent` includes the speech end reason. Interim and final input
+transcripts use LiveKit's standard transcription events.
+
+The model also emits SDK `ItemTruncated` payloads as `item_truncated` and
+`ResponseEnded` payloads as `response_ended`. Available retained text updates
+the plugin's history only while the server item ID still matches. `kept_text=None`
+means unavailable; an empty string means no words remain. This text describes
+server history, not necessarily what was heard, and does not replace LiveKit's
+playback transcript. Acknowledgments during generation may have no retained text,
+with no later update guaranteed.
+
+`ResponseEnded.truncation` reports items excluded from that reply's prompt.
+It does not delete local history. `None` means no exclusions were reported or the
+information was unavailable. Read `items_left_out` and `first_kept_item_id` from
+the summary for diagnostics.
+
+`PrismError` retains the provider fault, code, scope, IDs, and `retryable`.
+`PrismModelError` also exposes retryability. Retryability describes whether an
+unchanged request may succeed; recoverability describes whether the session can
+continue. Neither starts an automatic retry. An admission timeout fails the reply
+without closing an otherwise valid session.
+
+Manual audio commit, disabling server turn detection, per-reply tools, and video
+are unsupported. Use a separate TTS model for `session.say()`.
+Audio and output queues are bounded; overflow fails the session. The adapter
+retains up to 128 generations, evicting completed generations as new ones arrive.
+Truncation is available only for retained output references.
+
+Local WebSocket peer tests cover the SDK and ordinary AgentSession. They do not
+establish production endpoint compatibility or model quality for history-based
+text replies.
+
+Run the Rime regression tests from the repository root:
+
+```sh
+uv run pytest tests/test_plugin_rime.py --unit
+```
+
+The tests include response settings revisions, completed tool history rebuilds,
+history snapshot isolation, and cancellation during acknowledged updates.
+Validate typed replies and audio playback against the target Prism deployment
+separately. Caller-interruption checks require a speech fixture with nonzero audio.
