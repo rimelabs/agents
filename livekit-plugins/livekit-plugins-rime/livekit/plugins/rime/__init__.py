@@ -24,10 +24,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import realtime
 
+from .models import CustomLexiconEntry
 from .tts import TTS, ChunkedStream
 from .version import __version__
 
-__all__ = ["TTS", "ChunkedStream", "realtime", "__version__"]
+__all__ = ["TTS", "ChunkedStream", "CustomLexiconEntry", "realtime", "__version__"]
 
 from livekit.agents import Plugin
 
