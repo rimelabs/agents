@@ -133,7 +133,7 @@ Python Rime SDK. Use Python 3.11 or later. TTS still supports Python 3.10.
 uv pip install 'livekit-plugins-rime[realtime]'
 ```
 
-The realtime extra requires `rimelabs-sdk>=0.1.0a25`. For source development:
+The realtime extra requires `rimelabs-sdk>=0.1.0a26`. For source development:
 
 ```sh
 uv sync --package livekit-plugins-rime --extra realtime --inexact
@@ -176,7 +176,7 @@ session = AgentSession(llm=model)
 
 The plugin package requires `livekit-agents>=1.8.10`. The Prism adapter also has
 source compatibility checks against LiveKit 1.7.1, 1.8.6, and 1.8.8 with
-`rimelabs-sdk==0.1.0a25`. These checks load the plugin source directly; they do not
+`rimelabs-sdk==0.1.0a26`. These checks load the plugin source directly; they do not
 install this package on older core versions.
 
 LiveKit 1.7.1 fixes active-response cancellation through `SpeechHandle.interrupt()`.
@@ -292,7 +292,27 @@ Import `RetentionRatio` from `rimelabs_sdk.realtime`. Automatic truncation retai
 context no longer fits. This setting requires deployment support and does not
 erase the conversation record. Omit it for older deployments.
 
-The SDK and adapter do not automatically reconnect or replay accepted requests.
+The adapter retries initial HTTP refusals with status 408, 429, 500, 502, 503, or
+504 using the structured `status_code` supplied by SDK `0.1.0a26` or later. Other HTTP errors,
+unknown connection failures, and initialization timeouts fail without retry.
+A server that mislabels a billing refusal as 503 will receive bounded retries;
+the adapter cannot infer billing state from that status alone.
+
+Set `conn_options=APIConnectOptions(max_retry=3, retry_interval=2, timeout=10)`
+to configure retries and the maximum duration of each connection attempt,
+including SDK initialization. Import `APIConnectOptions` from `livekit.agents`.
+The default delays are 0.1, 2, and 2 seconds. A valid SDK `retry_after_s` is a
+minimum delay. `startup_timeout=30` bounds all attempts and delays together.
+These limits bound startup failure reporting; closing waits for SDK cleanup.
+If the server's requested delay cannot fit, the original refusal ends startup.
+The SDK's `timeouts=` still controls individual protocol operations. Set
+`max_retry=0` to disable retries. Closing the session cancels startup and delays.
+Errors emitted while a retry will occur have `recoverable=True`; permanent or
+exhausted failures emit `recoverable=False`. Waiting settings and reply requests
+remain pending until initialization succeeds or fails.
+
+The SDK and adapter do not automatically reconnect an established conversation
+or replay accepted requests.
 Standard LiveKit fallback can restart with supported history. It cannot restore
 an active tool round. Set `regenerate_on_swap=False` when an automatic replacement
 reply is unwanted. Text input submitted again is another history insertion.
@@ -336,7 +356,8 @@ the summary for diagnostics.
 `PrismError` retains the provider fault, code, scope, IDs, and `retryable`.
 `PrismModelError` also exposes retryability. Retryability describes whether an
 unchanged request may succeed; recoverability describes whether the session can
-continue. Neither starts an automatic retry. An admission timeout fails the reply
+continue. Startup retries follow the connection policy above; these flags do not
+retry a failed reply. An admission timeout fails the reply
 without closing an otherwise valid session.
 
 Manual audio commit, disabling server turn detection, per-reply tools, and video
