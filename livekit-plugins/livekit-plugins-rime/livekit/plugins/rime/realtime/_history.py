@@ -7,21 +7,65 @@ import asyncio
 import json
 import time
 from collections import OrderedDict
-from typing import cast
+from dataclasses import dataclass, field
+from typing import Literal, cast
 
 from rimelabs_sdk import realtime as r
 
 from livekit.agents import llm
 
-from ..log import logger
+
+class PrismHistoryUpdateError(Exception):
+    """A failed edit, separate from the usability of the provider session.
+
+    This is not a ``llm.RealtimeError``: LiveKit treats that type as a best-effort
+    input update and can start a reply even when the input was rejected.
+    ``needs_reconciliation`` signals possible local/provider differences. Repair
+    is optional for recoverable errors; independent operations remain available.
+    Messages exclude transcript content.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: Literal["rejected", "partial", "uncertain"] = "rejected",
+        confirmed_chat_ctx: llm.ChatContext | None = None,
+        needs_reconciliation: bool = True,
+    ):
+        super().__init__(message)
+        self.code = f"history_update_{status}"
+        self.status = status
+        self.recoverable = status != "uncertain"
+        self.confirmed_chat_ctx = confirmed_chat_ctx
+        self.needs_reconciliation = needs_reconciliation
+
+    @property
+    def partial(self) -> bool:
+        return self.status == "partial"
 
 
-class HistoryUpdateError(llm.RealtimeError):
-    """A rejected history change, or a partially applied change that requires recovery."""
+HistoryUpdateError = PrismHistoryUpdateError
 
-    def __init__(self, message: str, *, partial: bool = False):
-        super().__init__(message, code="history_update_failed")
-        self.partial = partial
+
+@dataclass(frozen=True)
+class HistoryUpdateNotice:
+    """A failed update snapshot; reconciliation repairs local state, not admission."""
+
+    session_id: str
+    status: Literal["rejected", "partial", "uncertain"]
+    recoverable: bool
+    confirmed_chat_ctx: llm.ChatContext | None = field(repr=False)
+    needs_reconciliation: bool = True
+
+
+@dataclass
+class HistorySyncResult:
+    submitted: list[tuple[r.ToolCallRef, llm.FunctionCallOutput]] = field(default_factory=list)
+    failure: PrismHistoryUpdateError | None = None
+    committed: bool = False
+    created: set[str] = field(default_factory=set)
+    history_read: bool = False
 
 
 def _items(ctx: llm.ChatContext) -> list[llm.ChatItem]:
@@ -54,7 +98,6 @@ def _wire(item: llm.ChatItem, *, validate_text: bool = True) -> r.HistoryItem:
                 {
                     "status": "failed",
                     "reason": "tool_error",
-                    "retryable": False,
                     "message": output,
                     "result": None,
                 }
@@ -91,15 +134,53 @@ class PrismHistory:
         self._chat = llm.ChatContext.empty()
         self._calls: OrderedDict[str, tuple[r.ToolCallRef, llm.FunctionCall]] = OrderedDict()
         self._lock = asyncio.Lock()
-        self._failure: HistoryUpdateError | None = None
+        self._terminal_failure: HistoryUpdateError | None = None
         self._ids: dict[str, str] = {}
         self._active: dict[str, set[str]] = {}
         self._response_revision = 0
+        self._revision = 0
+        self._variants: dict[str, set[str]] = {}
+        self._played: dict[str, str] = {}
+        self._holds: dict[str, r.ResponseHold] = {}
 
     @property
     def chat_ctx(self) -> llm.ChatContext:
         """Return a snapshot whose items cannot change the acknowledged record."""
         return llm.ChatContext([item.model_copy(deep=True) for item in self._chat.items])
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def projection(self, local: llm.ChatContext) -> llm.ChatContext:
+        result = self.chat_ctx
+        for item in result.items:
+            if isinstance(item, llm.ChatMessage) and item.id in self._played:
+                item.content = [self._played[item.id]]
+        # Local configuration records can hold tools bound to a running agent.
+        result.items.extend(
+            item.model_copy()
+            for item in local.items
+            if not isinstance(item, (llm.ChatMessage, llm.FunctionCall, llm.FunctionCallOutput))
+        )
+        return result
+
+    async def reconcile(self, target: llm.ChatContext, revision: int) -> None:
+        async with self._lock:
+            if revision != self._revision or _items(target) != _items(self.projection(target)):
+                raise HistoryUpdateError(
+                    "History changed during reconciliation",
+                    confirmed_chat_ctx=self.projection(llm.ChatContext.empty()),
+                )
+
+    def release_response(self, response_id: str) -> None:
+        hold = self._holds.pop(response_id, None)
+        if hold is not None:
+            hold.release()
+
+    def close(self) -> None:
+        for response_id in list(self._holds):
+            self.release_response(response_id)
 
     async def get_history(self) -> tuple[r.HistoryItem, ...]:
         """Read completed server history after any pending history update."""
@@ -109,8 +190,8 @@ class PrismHistory:
     async def wait_for_updates(self) -> None:
         """Wait for pending edits without holding a lock during reply admission."""
         async with self._lock:
-            if self._failure is not None:
-                raise self._failure
+            if self._terminal_failure is not None:
+                raise self._terminal_failure
 
     def last_call(self, response: r.ResponseRef) -> r.ToolCallRef | None:
         """Find the latest retained call for a tool-continuation fallback."""
@@ -140,14 +221,31 @@ class PrismHistory:
             name=payload.name,
             arguments=json.dumps(payload.arguments),
         )
+        if payload.call.call_id in self._calls:
+            return self._calls[payload.call.call_id][1].model_copy(deep=True)
+        if payload.call.response_id not in self._holds:
+            self._holds[payload.call.response_id] = self._sdk.hold_response(payload.call)
         self._calls[payload.call.call_id] = (payload.call, call)
-        while len(self._calls) > 1024:
-            self._calls.popitem(last=False)
+        if len(self._calls) > 1024:
+            completed = {
+                i.call_id for i in self._chat.items if isinstance(i, llm.FunctionCallOutput)
+            }
+            for key in list(self._calls):
+                if len(self._calls) <= 1024:
+                    break
+                if key in completed and self._calls[key][0].response_id not in self._holds:
+                    del self._calls[key]
         self._chat.items.append(call)
+        self._revision += 1
         return call.model_copy(deep=True)
 
-    def record_assistant(self, message_id: str, transcript: str) -> None:
+    def record_assistant(self, message_id: str, transcript: str, *, played: bool = False) -> None:
         """Record completed or interrupted output, including an unheard message."""
+        self._revision += 1
+        self._variants.setdefault(message_id, set()).add(transcript)
+        if played:
+            self._played[message_id] = transcript
+            return
         self._chat._upsert_item(
             llm.ChatMessage(id=message_id, role="assistant", content=[transcript])
         )
@@ -195,6 +293,7 @@ class PrismHistory:
         elif isinstance(payload, r.InputCommitted):
             self._ids.setdefault(payload.item_id, payload.item_id)
             if not self._chat.get_by_id(payload.item_id):
+                self._revision += 1
                 self._chat.items.append(
                     llm.ChatMessage(
                         id=payload.item_id,
@@ -204,6 +303,7 @@ class PrismHistory:
                     )
                 )
         elif isinstance(payload, r.TranscriptFinal):
+            self._revision += 1
             self._ids.setdefault(payload.item_id, payload.item_id)
             self._chat._upsert_item(
                 llm.ChatMessage(
@@ -233,32 +333,135 @@ class PrismHistory:
                     continue
                 item = self._chat.get_by_id(local_id)
                 if isinstance(item, llm.ChatMessage) and item.role == "assistant":
+                    self._revision += 1
+                    self._variants.setdefault(local_id, set()).update(
+                        (item.text_content or "", payload.kept_text)
+                    )
                     item.content = [payload.kept_text]
                 break
 
-    async def sync(
-        self, target: llm.ChatContext
-    ) -> list[tuple[r.ToolCallRef, llm.FunctionCallOutput]]:
-        """Apply a validated edit and preserve events received during acknowledgments."""
-        async with self._lock:
-            if self._failure is not None:
-                raise self._failure
-            try:
-                return await self._sync(target)
-            except HistoryUpdateError as error:
-                if error.partial:
-                    # Reject queued edits before releasing the lock. Session
-                    # shutdown is scheduled by the caller after this method raises.
-                    self._failure = error
-                raise
+    def _shared_target(self, target: llm.ChatContext) -> llm.ChatContext:
+        old = {item.id: item for item in self._chat.items}
+        additions: list[llm.ChatItem] = []
+        seen: set[str] = set()
+        positions = {item.id: index for index, item in enumerate(self._chat.items)}
+        last = -1
+        for item in _items(target):
+            if isinstance(item, llm.FunctionCall) and item.extra.get(
+                "__livekit_agents_tool_non_blocking"
+            ):
+                raise HistoryUpdateError("Prism does not support tool progress updates")
+            if item.id in seen:
+                raise HistoryUpdateError("Prism history item IDs must be unique")
+            seen.add(item.id)
+            previous = old.get(item.id)
+            if previous is None:
+                additions.append(item)
+                continue
+            if additions or positions[item.id] < last:
+                raise HistoryUpdateError(
+                    "Shared history requires append order; use replace_chat_ctx"
+                )
+            last = positions[item.id]
+            if _wire(previous, validate_text=False) == _wire(item, validate_text=False):
+                continue
+            if (
+                isinstance(previous, llm.ChatMessage)
+                and isinstance(item, llm.ChatMessage)
+                and previous.role == item.role
+                and all(isinstance(c, str) for c in item.content)
+                and item.text_content in self._variants.get(item.id, set())
+            ):
+                continue
+            raise HistoryUpdateError(
+                "Shared history conflicts with confirmed content; use replace_chat_ctx"
+            )
+        return llm.ChatContext([*self._chat.items, *additions])
 
-    async def _sync(
-        self, target: llm.ChatContext
-    ) -> list[tuple[r.ToolCallRef, llm.FunctionCallOutput]]:
+    async def sync(self, target: llm.ChatContext, *, shared: bool = False) -> HistorySyncResult:
+        """Journal acknowledgments before the next write; never replay a failed edit."""
+        async with self._lock:
+            result = HistorySyncResult()
+            baseline = {item.id for item in self._chat.items}
+            failure: Exception | None = None
+            try:
+                if self._terminal_failure is not None:
+                    raise self._terminal_failure
+                if shared:
+                    target = self._shared_target(target)
+                await self._sync(target, result)
+            except Exception as caught_error:
+                failure = caught_error
+            known = (
+                failure is None
+                or (isinstance(failure, HistoryUpdateError) and failure.recoverable)
+                or (isinstance(failure, r.RimeRealtimeError) and failure.fault.scope == "event")
+            )
+            arrived = {item.id for item in self._chat.items} - baseline - result.created
+            if known and result.created and arrived:
+                try:
+                    await self._repair_order(baseline, result)
+                except Exception:
+                    # A missing active item is not deleted. Its order is unknown,
+                    # so no guessed projection can be reported as confirmed.
+                    known = False
+                    failure = HistoryUpdateError(
+                        "Prism history order is uncertain", status="uncertain"
+                    )
+            if failure is not None:
+                status: Literal["rejected", "partial", "uncertain"] = (
+                    ("partial" if result.committed else "rejected") if known else "uncertain"
+                )
+                error = HistoryUpdateError(
+                    "Prism history update was partially applied"
+                    if status == "partial"
+                    else str(failure)
+                    if isinstance(failure, HistoryUpdateError)
+                    else "Prism history update " + status,
+                    status=status,
+                    confirmed_chat_ctx=self.projection(llm.ChatContext.empty()) if known else None,
+                )
+                result.failure = error
+                if not error.recoverable:
+                    self._terminal_failure = error
+            return result
+
+    async def _repair_order(self, baseline: set[str], result: HistorySyncResult) -> None:
+        """Use at most one read when events cross an acknowledgment boundary.
+
+        The SDK's event queue and request futures do not expose a common sequence
+        number. A snapshot can establish completed-item order without replaying a
+        write. Omitted baseline items are preserved, including active calls.
+        """
+        if result.history_read:
+            raise HistoryUpdateError(
+                "History already used its identity repair read", status="uncertain"
+            )
+        result.history_read = True
+        snapshot = await self._sdk.get_history()
+        by_call = {i.call_id: i.id for i in snapshot if isinstance(i, r.HistoryFunctionResult)}
+        for item in self._chat.items:
+            if isinstance(item, llm.FunctionCallOutput) and item.id not in self._ids:
+                if server_id := by_call.get(item.call_id):
+                    self._ids[item.id] = server_id
+        local = {self._ids.get(item.id): item for item in self._chat.items if item.id in self._ids}
+        ordered = [local[item.id] for item in snapshot if item.id in local]
+        covered = {item.id for item in ordered}
+        required = {item.id for item in self._chat.items} - baseline
+        if not required <= covered:
+            raise HistoryUpdateError(
+                "Concurrent history order cannot be confirmed", status="uncertain"
+            )
+        iterator = iter(ordered)
+        self._chat.items[:] = [
+            next(iterator) if item.id in covered else item for item in self._chat.items
+        ]
+        self._revision += 1
+
+    async def _sync(self, target: llm.ChatContext, result: HistorySyncResult) -> None:
         response_revision = self._response_revision
         old = list(self._chat.items)
         desired = _items(target)
-        old_ids = {i.id for i in old}
         old_by_id = {i.id: i for i in old}
         new_by_id = {i.id: i for i in desired}
         unchanged = {
@@ -333,10 +536,11 @@ class PrismHistory:
                 if requested_calls[item.call_id].extra.get("__livekit_agents_tool_non_blocking"):
                     raise HistoryUpdateError("Prism does not support tool progress updates")
         deletions = old if rebuild else removed
-        if deletions:
+        if any(item.id not in self._ids for item in deletions):
             # Resolve server IDs for typed turns and live results not returned by
             # the older submit_tool_result interface. Never interpret absent active
             # items as deleted; unknown identity prevents mutation.
+            result.history_read = True
             snapshot = await self._sdk.get_history()
             by_call = {i.call_id: i.id for i in snapshot if isinstance(i, r.HistoryFunctionResult)}
             for item in deletions:
@@ -346,72 +550,56 @@ class PrismHistory:
                         self._ids[item.id] = server_id
                 if item.id not in self._ids:
                     raise HistoryUpdateError("Prism has not published the history item's server ID")
-        committed = False
-        submitted: list[tuple[r.ToolCallRef, llm.FunctionCallOutput]] = []
-        try:
-            deleted_calls: set[str] = set()
-            for item in deletions:
-                if isinstance(item, (llm.FunctionCall, llm.FunctionCallOutput)):
-                    if item.call_id in deleted_calls:
-                        continue
-                    deleted_calls.add(item.call_id)
-                if rebuild and self._response_revision != response_revision:
-                    raise HistoryUpdateError("A new reply started during history replacement")
-                await self._sdk.delete_item(self._ids[item.id])
-                committed = True
-                if rebuild and self._response_revision != response_revision:
-                    raise HistoryUpdateError("A new reply started during history replacement")
-            for item in to_create:
-                if (
-                    not rebuild
-                    and isinstance(item, llm.FunctionCallOutput)
-                    and item.call_id in self._calls
-                ):
-                    ref = self._calls[item.call_id][0]
-                    wire = cast(r.HistoryFunctionResult, _wire(item))
-                    await self._sdk.submit_tool_result(ref, wire.output)
-                    submitted.append((ref, item.model_copy(deep=True)))
-                else:
-                    if rebuild and self._response_revision != response_revision:
-                        raise HistoryUpdateError("A new reply started during history replacement")
-                    # Let Prism assign a fresh ID. Omitting optional client IDs
-                    # also preserves the existing text-history request shape.
-                    ref_item = await self._sdk.create_item(_wire(item))
-                    self._ids[item.id] = ref_item.item_id
-                committed = True
-                if additions_only:
-                    # Insert before observations that arrived during acknowledgment.
-                    self._chat.items.insert(desired.index(item), item.model_copy(deep=True))
-                if rebuild and self._response_revision != response_revision:
-                    raise HistoryUpdateError("A new reply started during history replacement")
-        except Exception as error:
-            if (
-                (additions_only or not committed)
-                and isinstance(error, r.RimeRealtimeError)
-                and error.fault.scope == "event"
-            ):
-                logger.warning(
-                    "Prism rejected part of a chat context update",
-                    extra={"error": str(error)},
-                )
-                # Keep only acknowledged items, including newer speech. Let the
-                # caller continue with any tool results accepted before the refusal.
-                return submitted
-            if committed:
-                raise HistoryUpdateError(
-                    "Prism history update was partially applied; restart required", partial=True
-                ) from error
-            raise
-        # Events can append to the local record while acknowledgments are pending.
-        # Keep those events rather than overwriting them with the caller's snapshot.
-        arrived = [i for i in self._chat.items if i.id not in old_ids and i.id not in new_by_id]
-        current = {i.id: i for i in self._chat.items}
-        self._chat.items[:] = [
-            current.get(i.id, i) if i.id in unchanged else i.model_copy(deep=True) for i in desired
-        ] + arrived
         for item in deletions:
-            if isinstance(item, llm.FunctionCall):
-                self._calls.pop(item.call_id, None)
-        for item in removed:
-            self._ids.pop(item.id, None)
-        return submitted
+            # Deleting either half retires the complete call/result pair.
+            if self._chat.get_by_id(item.id) is None:
+                continue
+            if rebuild and self._response_revision != response_revision:
+                raise HistoryUpdateError("A new reply started during history replacement")
+            await self._sdk.delete_item(self._ids[item.id])
+            result.committed = True
+            retiring = [
+                i
+                for i in self._chat.items
+                if i.id == item.id
+                or (
+                    isinstance(item, (llm.FunctionCall, llm.FunctionCallOutput))
+                    and isinstance(i, (llm.FunctionCall, llm.FunctionCallOutput))
+                    and item.call_id == i.call_id
+                )
+            ]
+            for retired in retiring:
+                self._chat.items.remove(retired)
+                self._ids.pop(retired.id, None)
+                self._variants.pop(retired.id, None)
+                self._played.pop(retired.id, None)
+                if isinstance(retired, llm.FunctionCall):
+                    self._calls.pop(retired.call_id, None)
+            self._revision += 1
+            if rebuild and self._response_revision != response_revision:
+                raise HistoryUpdateError("A new reply started during history replacement")
+        for item in to_create:
+            if rebuild and self._response_revision != response_revision:
+                raise HistoryUpdateError("A new reply started during history replacement")
+            if (
+                not rebuild
+                and isinstance(item, llm.FunctionCallOutput)
+                and item.call_id in self._calls
+            ):
+                ref = self._calls[item.call_id][0]
+                wire = cast(r.HistoryFunctionResult, _wire(item))
+                await self._sdk.submit_tool_result(ref, wire.output)
+                result.submitted.append((ref, item.model_copy(deep=True)))
+            else:
+                ref_item = await self._sdk.create_item(_wire(item))
+                self._ids[item.id] = ref_item.item_id
+            result.committed = True
+            self._revision += 1
+            result.created.add(item.id)
+            # Provisional order. Interleaved observations require one authoritative
+            # read before this update returns or exposes a recoverable failure.
+            self._chat.items.insert(
+                min(desired.index(item), len(self._chat.items)), item.model_copy(deep=True)
+            )
+            if rebuild and self._response_revision != response_revision:
+                raise HistoryUpdateError("A new reply started during history replacement")
