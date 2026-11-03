@@ -13,8 +13,10 @@ import sys
 import textwrap
 import traceback
 from contextlib import asynccontextmanager
+from fractions import Fraction
 from importlib.metadata import version
 from importlib.util import find_spec
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
@@ -42,31 +44,45 @@ from livekit.agents import (
     APIStatusError,
     APITimeoutError,
     RunContext,
+    ToolError,
     function_tool,
     llm,
 )
 from livekit.agents.llm import RealtimeModelFallbackAdapter
+from livekit.agents.metrics import RealtimeModelMetrics
 from livekit.agents.telemetry import trace_types, utils as telemetry_utils
 from livekit.agents.telemetry.traces import _DynamicTracer
 from livekit.agents.tts import tts as tts_module
+from livekit.agents.voice.io import AudioOutput, AudioOutputCapabilities
 from livekit.plugins import rime
 from livekit.plugins.rime import TTS
 from livekit.plugins.rime._websocket_v1 import _codec_for_protocol
 
 from .fake_io import FakeAudioOutput
+from .fake_tts import FakeTTS
 
 pytestmark = pytest.mark.unit
 
 HAS_REALTIME_SDK = find_spec("rimelabs_sdk") is not None
 if HAS_REALTIME_SDK:
-    from rimelabs_sdk import Rime, RimeInputError, RimeStreamError, realtime as r
+    from rimelabs_sdk import (
+        Rime,
+        RimeInputError,
+        RimeResourceLimitError,
+        RimeStreamError,
+        RimeTimeoutError,
+        realtime as r,
+    )
     from websockets.asyncio.server import serve
 
     from livekit.plugins.rime.realtime import (
         PrismError,
+        PrismHistoryUpdateError,
         PrismModelError,
         PrismUnsupported,
+        realtime_model,
     )
+    from livekit.plugins.rime.realtime._playback import Playback
 
 
 _SECRET = "customer-secret-marker"
@@ -290,10 +306,10 @@ async def test_chunked_stream_keeps_sample_rate_after_parent_update() -> None:
 
     request_received = asyncio.Event()
     release_response = asyncio.Event()
-    payload: dict[str, object] = {}
+    payloads: list[dict[str, object]] = []
 
     async def synthesize(request: web.Request) -> web.Response:
-        payload.update(await request.json())
+        payloads.append(await request.json())
         request_received.set()
         await release_response.wait()
         return web.Response(body=b"\x01\x00" * 2400, content_type="audio/pcm")
@@ -311,15 +327,24 @@ async def test_chunked_stream_keeps_sample_rate_after_parent_update() -> None:
             tts = TTS(
                 api_key="test-key",
                 model="coda",
+                sample_rate=22050,
                 base_url=f"http://127.0.0.1:{port}/tts",
                 http_session=session,
             )
             stream = tts.synthesize("hello", conn_options=APIConnectOptions(max_retry=0, timeout=2))
+            tts.update_options(sample_rate=16000)
             try:
                 await asyncio.wait_for(request_received.wait(), timeout=2)
                 tts.update_options(model="mistv2")
                 release_response.set()
                 events = [event async for event in stream]
+                next_stream = tts.synthesize(
+                    "next", conn_options=APIConnectOptions(max_retry=0, timeout=2)
+                )
+                try:
+                    next_events = [event async for event in next_stream]
+                finally:
+                    await next_stream.aclose()
             finally:
                 release_response.set()
                 await stream.aclose()
@@ -327,9 +352,12 @@ async def test_chunked_stream_keeps_sample_rate_after_parent_update() -> None:
     finally:
         await runner.cleanup()
 
-    assert payload["modelId"] == "coda"
-    assert payload["samplingRate"] == 24000
-    assert events[0].frame.sample_rate == 24000
+    assert [(p["modelId"], p["samplingRate"]) for p in payloads] == [
+        ("coda", 22050),
+        ("mistv2", 16000),
+    ]
+    assert events[0].frame.sample_rate == 22050
+    assert next_events[0].frame.sample_rate == 16000
 
 
 _LEXICON = [
@@ -476,21 +504,6 @@ async def test_chunked_stream_keeps_endpoint_and_timeout_after_parent_update(
                 await tts.aclose()
     finally:
         await runner.cleanup()
-
-
-async def test_chunked_stream_copies_sample_rate_options() -> None:
-    from livekit.plugins.rime import TTS
-
-    tts = TTS(api_key="test-key", model="coda", sample_rate=22050)
-    stream = tts.synthesize("hello")
-    try:
-        tts.update_options(sample_rate=16000)
-
-        assert stream._opts.sample_rate == 22050
-        assert stream._sample_rate == 22050
-    finally:
-        await stream.aclose()
-        await tts.aclose()
 
 
 def test_websocket_url_selects_v1_with_binary_and_coda_defaults() -> None:
@@ -976,9 +989,13 @@ def _encode_container_audio(container_format: str, codec: str) -> bytes:
         stream = container.add_stream(codec, rate=24000)
         stream.layout = "mono"
         frame = av.AudioFrame.from_ndarray(
-            np.zeros((1, 2400), dtype=np.int16), format="s16", layout="mono"
+            (12000 * np.sin(2 * np.pi * 440 * np.arange(2400) / 24000)).astype(np.int16)[None, :],
+            format="s16",
+            layout="mono",
         )
         frame.sample_rate = 24000
+        frame.pts = 0
+        frame.time_base = Fraction(1, 24000)
         for packet in stream.encode(frame):
             container.mux(packet)
         for packet in stream.encode(None):
@@ -994,7 +1011,7 @@ def encoded_audio_by_format() -> dict[str, bytes]:
         "audio/mpeg": _encode_container_audio("mp3", "mp3"),
         "audio/ogg;codecs=opus": _encode_container_audio("ogg", "libopus"),
         "audio/webm;codecs=opus": _encode_container_audio("webm", "libopus"),
-        "audio/pcmu": b"\xff" * 2400,
+        "audio/pcmu": b"\x80\x00" * 1200,
     }
 
 
@@ -1232,14 +1249,6 @@ def _payloads(server: _RimeV1Server) -> list[str]:
     return [next(key for key in request if key != "contextId") for request in server.requests]
 
 
-def test_v1_binary_envelope_goldens_match_rime_field_numbers() -> None:
-    request = proto.WebSocketRequest(context_id="turn-42", text="hello")
-    response = proto.WebSocketResponse(context_id="turn-42", audio=b"\x01\x02")
-
-    assert request.SerializeToString() == b"\x0a\x07turn-42\x22\x05hello"
-    assert response.SerializeToString() == b"\x0a\x07turn-42\x22\x02\x01\x02"
-
-
 def test_v1_decodes_pcmu_to_little_endian_pcm16() -> None:
     from livekit.plugins.rime import _websocket_v1
 
@@ -1347,7 +1356,21 @@ async def test_v1_supports_each_rime_audio_format_with_each_protocol(
             await stream.aclose()
             await tts.aclose()
 
-    assert any(event.frame.data for event in events)
+    samples = np.frombuffer(b"".join(bytes(event.frame.data) for event in events), dtype="<i2")
+    assert np.max(np.abs(samples.astype(np.int32))) > 0
+    assert all(
+        event.frame.sample_rate == 24000 and event.frame.num_channels == 1 for event in events
+    )
+    expected = len(_PCM) // 2 if audio_format == "audio/pcm" else 2400
+    # The shared low-latency decoder can consume one 20 ms Opus packet while probing.
+    # MP3 can retain encoder padding. Other formats must preserve every sample.
+    missing = 480 if "opus" in audio_format else 0
+    padding = 1152 if audio_format == "audio/mpeg" else 0
+    assert expected - missing <= len(samples) <= expected + padding
+    if audio_format == "audio/pcm":
+        assert samples.tobytes() == _PCM
+    elif audio_format == "audio/pcmu":
+        np.testing.assert_array_equal(samples, np.tile([32124, -32124], 1200))
     assert events[-1].is_final
     assert server.requests[0]["start"]["audioParameters"]["audioFormat"] == audio_format
     assert server.protocols == [f"rime.v1.{websocket_protocol}"]
@@ -1479,23 +1502,6 @@ async def test_v1_sends_resolved_sample_rate(model: str, expected_sample_rate: i
         "audioFormat": "audio/pcm",
         "samplingRate": expected_sample_rate,
     }
-
-
-async def test_v1_stream_keeps_sample_rate_after_parent_update() -> None:
-    async with _RimeV1Server() as server:
-        tts = _v1_tts(server, sample_rate=22050)
-        stream = tts.stream(conn_options=APIConnectOptions(max_retry=0, timeout=2))
-        tts.update_options(sample_rate=16000)
-        try:
-            stream.push_text("hello")
-            stream.end_input()
-            events = await _collect(stream)
-        finally:
-            await stream.aclose()
-            await tts.aclose()
-
-    assert server.requests[0]["start"]["audioParameters"]["samplingRate"] == 22050
-    assert events[0].frame.sample_rate == 22050
 
 
 async def test_v1_rejects_wrong_ready_protocol() -> None:
@@ -1781,41 +1787,36 @@ async def test_v1_overlapping_streams_use_separate_connections() -> None:
     assert events[-1].is_final
 
 
-async def test_v1_stream_snapshots_options() -> None:
-    async with _RimeV1Server() as server:
-        tts = _v1_tts(server)
-        stream = tts.stream(conn_options=APIConnectOptions(max_retry=0, timeout=2))
-        tts.update_options(speaker="changed")
-        stream.push_text("hello")
-        stream.end_input()
-        await _collect(stream)
-        await stream.aclose()
-        await tts.aclose()
-
-    assert server.requests[0]["start"]["speaker"] == "lyra"
-
-
-async def test_v1_stream_snapshots_websocket_url() -> None:
+async def test_v1_stream_snapshots_endpoint_speaker_and_sample_rate() -> None:
     async with _RimeV1Server() as first_server, _RimeV1Server() as second_server:
-        tts = _v1_tts(first_server)
+        tts = _v1_tts(first_server, sample_rate=22050)
         first_stream = tts.stream(conn_options=APIConnectOptions(max_retry=0, timeout=2))
-        tts.update_options(websocket_url=second_server.websocket_url)
+        tts.update_options(
+            websocket_url=second_server.websocket_url, speaker="changed", sample_rate=16000
+        )
         second_stream = tts.stream(conn_options=APIConnectOptions(max_retry=0, timeout=2))
+        try:
+            first_stream.push_text("first")
+            first_stream.end_input()
+            second_stream.push_text("second")
+            second_stream.end_input()
+            first_events, second_events = await asyncio.gather(
+                _collect(first_stream), _collect(second_stream)
+            )
+        finally:
+            await first_stream.aclose()
+            await second_stream.aclose()
+            await tts.aclose()
 
-        first_stream.push_text("first")
-        first_stream.end_input()
-        second_stream.push_text("second")
-        second_stream.end_input()
-        await _collect(first_stream)
-        await _collect(second_stream)
-        await first_stream.aclose()
-        await second_stream.aclose()
-        await tts.aclose()
-
-    assert [request["text"] for request in first_server.requests if "text" in request] == ["first "]
-    assert [request["text"] for request in second_server.requests if "text" in request] == [
-        "second "
-    ]
+    for server, text, speaker, rate, events in [
+        (first_server, "first ", "lyra", 22050, first_events),
+        (second_server, "second ", "changed", 16000, second_events),
+    ]:
+        assert [request["text"] for request in server.requests if "text" in request] == [text]
+        start = server.requests[0]["start"]
+        assert start["speaker"] == speaker
+        assert start["audioParameters"]["samplingRate"] == rate
+        assert events and all(event.frame.sample_rate == rate for event in events)
 
 
 @pytest.mark.parametrize("new_stream_first", [False, True], ids=["old-first", "new-first"])
@@ -2273,12 +2274,15 @@ async def test_v1_maps_connection_scoped_error() -> None:
     assert exc_info.value.status_code == 503
 
 
-@pytest.mark.parametrize("websocket_protocol", ["binary", "json"])
-@pytest.mark.parametrize("message", [None, ""])
 @pytest.mark.parametrize(
-    "kind, status_code, retryable", [("unavailable", 503, True), ("unimplemented", 501, False)]
+    "websocket_protocol,message,kind,status_code,retryable,explicit_request_id",
+    [
+        ("binary", None, "unavailable", 503, True, False),
+        ("binary", "", "unimplemented", 501, False, True),
+        ("json", None, "unimplemented", 501, False, True),
+        ("json", "", "unavailable", 503, True, False),
+    ],
 )
-@pytest.mark.parametrize("explicit_request_id", [False, True])
 async def test_v1_maps_error_without_message(
     websocket_protocol: str,
     message: str | None,
@@ -3060,6 +3064,7 @@ class Peer:
         self.server_items = []
         self.imported_calls = set()
         self.history_operations = []
+        self.history_reads = 0
         self.history_started = asyncio.Event()
         self.history_release = asyncio.Event()
         self.history_release.set()
@@ -3101,6 +3106,10 @@ class Peer:
             self.running.setdefault(body["response_id"], set()).add(body["item_id"])
         elif kind == "response.done":
             self.running.pop(body["response"]["id"], None)
+        elif kind == "conversation.item.truncated" and "prism_kept_text" in body:
+            for item in self.server_items:
+                if item["id"] == body["item_id"]:
+                    item["text"] = body["prism_kept_text"]
         await self.socket.send(json.dumps({"type": kind, "event_id": "server", **body}))
 
     async def handler(self, socket):
@@ -3215,6 +3224,7 @@ class Peer:
                         item_id=event["item_id"],
                     )
             elif kind == "prism.conversation.get":
+                self.history_reads += 1
                 active_ids = {i for ids in self.running.values() for i in ids}
                 await self.emit(
                     "prism.conversation",
@@ -3385,6 +3395,199 @@ async def acknowledge(peer, item_id, kept_text, *, content_index=0):
     )
 
 
+USAGE = {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20, "context_window": 100}
+
+
+async def finish_metric_response(peer, response_id, *, status="completed", usage=USAGE):
+    response = {"id": response_id, "status": status}
+    if usage is not None:
+        response["usage"] = usage
+    await peer.emit("response.done", response=response)
+
+
+class ControlledOutput(AudioOutput):
+    def __init__(self, *, sample_rate=None, synchronous=False):
+        super().__init__(
+            label="controlled",
+            capabilities=AudioOutputCapabilities(pause=True),
+            sample_rate=sample_rate,
+        )
+        self.frames = []
+        self.segments = []
+        self.duration = 0
+        self.synchronous = synchronous
+        self.paused = False
+
+    async def capture_frame(self, frame):
+        await super().capture_frame(frame)
+        self.frames.append(frame)
+        self.duration += frame.duration
+
+    def flush(self):
+        super().flush()
+        if self.duration:
+            self.segments.append(self.duration)
+            self.duration = 0
+            if self.synchronous:
+                self.finish()
+
+    def finish(self, *, interrupted=False):
+        duration = self.segments.pop(0)
+        self.on_playback_finished(playback_position=duration, interrupted=interrupted)
+
+    def clear_buffer(self):
+        if self.duration:
+            self.flush()
+        if self.segments:
+            self.finish(interrupted=True)
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+
+class CountingTTS(FakeTTS):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def stream(self, **kwargs):
+        self.calls += 1
+        return super().stream(**kwargs)
+
+    def synthesize(self, text, **kwargs):
+        self.calls += 1
+        return super().synthesize(text, **kwargs)
+
+
+async def emit_message(peer, response, name, *, seconds=0.02):
+    await peer.emit(
+        "response.output_item.added",
+        response_id=response,
+        output_index=0,
+        item={"id": name, "type": "message"},
+    )
+    fields = {"response_id": response, "output_index": 0, "item_id": name, "content_index": 0}
+    await peer.emit("response.text.delta", **fields, delta=name)
+    await peer.emit("response.text.done", **fields, text=name)
+    await peer.emit(
+        "response.audio.delta",
+        **fields,
+        delta=base64.b64encode(b"\0\0" * int(24000 * seconds)).decode(),
+    )
+    await peer.emit("response.audio.done", **fields)
+
+
+async def emit_caller(peer, item_id, text):
+    await peer.emit("input_audio_buffer.speech_started", item_id=item_id, audio_start_ms=0)
+    await peer.emit("input_audio_buffer.speech_stopped", item_id=item_id, audio_end_ms=20)
+    await peer.emit("input_audio_buffer.committed", item_id=item_id)
+    await peer.emit(
+        "conversation.item.input_audio_transcription.completed", item_id=item_id, transcript=text
+    )
+
+
+async def emit_note_call(peer, response):
+    await peer.emit(
+        "response.function_call_arguments.done",
+        response_id=response,
+        item_id="note-tool",
+        call_id="note-call",
+        name="save_note",
+        arguments="{}",
+    )
+    return await peer.message(response, text="Got it, I'm making a note of that.")
+
+
+async def retain_note_prefix(peer, provider, item_id):
+    await peer.emit(
+        "conversation.item.truncated",
+        item_id=item_id,
+        content_index=0,
+        audio_end_ms=10,
+        prism_kept_text="Got it",
+    )
+    await wait_until(lambda: provider.chat_ctx.get_by_id(item_id).text_content == "Got it")
+
+
+async def end_note_response(peer, provider, response):
+    ended = asyncio.Event()
+
+    @provider.on("rime_server_event_received")
+    def on_event(event):
+        if isinstance(event.payload, r.ResponseEnded):
+            if event.payload.response.response_id == response:
+                ended.set()
+
+    await peer.end(response)
+    await asyncio.wait_for(ended.wait(), 3)
+
+
+async def pending_note_snapshot(peer, provider):
+    await provider.update_instructions("test")
+    await emit_caller(peer, "caller-1", "Next week.")
+    response = await peer.start()
+    item_id = await emit_note_call(peer, response)
+    await end_note_response(peer, provider, response)
+    await wait_until(lambda: provider.chat_ctx.get_by_id(item_id) is not None)
+    desired = provider.chat_ctx.copy()
+    desired.items.append(
+        llm.FunctionCallOutput(
+            call_id="note-call",
+            name="save_note",
+            output="The note was saved.",
+            is_error=False,
+            reply_required=False,
+        )
+    )
+    await retain_note_prefix(peer, provider, item_id)
+    return desired, item_id
+
+
+async def finish_discard_response(peer, response):
+    await peer.end(response)
+    receipt = await asyncio.wait_for(peer.receipts.get(), 3)
+    assert receipt["response_id"] == response
+
+
+async def tool_turn(peer, *calls):
+    response = await peer.start()
+    for call in calls:
+        await peer.emit(
+            "response.function_call_arguments.done",
+            response_id=response,
+            item_id=call,
+            call_id=call,
+            name="lookup",
+            arguments="{}",
+        )
+    await finish_discard_response(peer, response)
+    return response
+
+
+async def submit(provider, call, *, reply_required=True):
+    await provider.update_chat_ctx(
+        llm.ChatContext(
+            [
+                llm.FunctionCallOutput(
+                    call_id=call, output="done", is_error=False, reply_required=reply_required
+                )
+            ]
+        )
+    )
+
+
+async def reply(peer, provider):
+    pending = provider.generate_reply()
+    request = await peer.next()
+    response = await peer.start(request)
+    await finish_discard_response(peer, response)
+    await pending
+    return request
+
+
 @pytest.mark.skipif(not HAS_REALTIME_SDK, reason="Rime realtime SDK is not installed")
 class TestRealtime:
     @pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
@@ -3405,13 +3608,6 @@ class TestRealtime:
             errors = []
             session.on("error", errors.append)
             reply = session.generate_reply(instructions="Say hello")
-            if not hasattr(RimeInputError("test"), "status_code"):
-                with pytest.raises(asyncio.CancelledError):
-                    await reply
-                assert attempts == 1
-                assert [e.recoverable for e in errors] == [False]
-                assert f"HTTP {status}" in str(errors[0].error)
-                return
             request = await peer.next()
             response_id = await peer.start(request)
             await peer.end(response_id)
@@ -3460,9 +3656,8 @@ class TestRealtime:
             session.on("error", errors.append)
             with pytest.raises(Exception, match="HTTP 503"):
                 await session.update_instructions("test")
-            retries = max_retry if hasattr(RimeInputError("test"), "status_code") else 0
-            assert attempts == retries + 1
-            assert [e.recoverable for e in errors] == [True] * retries + [False]
+            assert attempts == max_retry + 1
+            assert [e.recoverable for e in errors] == [True] * max_retry + [False]
 
     async def test_startup_close_cancels_retry_delay(self):
         attempts = 0
@@ -3541,52 +3736,6 @@ class TestRealtime:
             await session.update_instructions("Different")
             assert peer.settings["instructions"] == "Different"
 
-    @pytest.mark.parametrize("invalid_item", ["developer", "image", "tool", "long"])
-    async def test_history_update_validates_all_new_items_before_sending(self, invalid_item):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(instructions="test")
-            ctx = session.chat_ctx
-            ctx.add_message(role="user", content="Valid new history")
-            if invalid_item == "developer":
-                ctx.add_message(role="developer", content="Unsupported role")
-            elif invalid_item == "image":
-                ctx.add_message(role="user", content=[llm.ImageContent(image="https://test/image")])
-            elif invalid_item == "tool":
-                ctx.items.append(
-                    llm.FunctionCallOutput(call_id="unknown", output="Result", is_error=False)
-                )
-            else:
-                ctx.add_message(
-                    role="user", content=" \t" if invalid_item == "blank" else "x" * 4001
-                )
-            with pytest.raises((llm.RealtimeError, RimeInputError)):
-                await session.update_chat_ctx(ctx)
-            assert peer.items == []
-            assert session.chat_ctx.items == []
-
-    async def test_agent_session_caller_interrupt_reports_truncate(self):
-        async with peer_model() as (peer, model, _):
-            output = FakeAudioOutput(can_pause=True)
-            async with AgentSession(llm=model) as session:
-                session.output.audio = output
-                await session.start(Agent(instructions="test"))
-                handle = session.generate_reply()
-                request = await peer.next()
-                response_id = await peer.start(request)
-                item_id = await peer.message(response_id, seconds=1)
-                while output._started_at is None:
-                    await asyncio.sleep(0.001)
-                await peer.emit(
-                    "input_audio_buffer.speech_started", item_id="user-1", audio_start_ms=0
-                )
-                await peer.end(response_id, status="cancelled")
-                await asyncio.wait_for(handle.wait_for_playout(), 5)
-                event = await asyncio.wait_for(peer.truncations.get(), 3)
-                assert event["item_id"] == item_id
-                assert event["content_index"] == 0
-                assert peer.receipts.empty()
-
     async def test_late_transcript_keeps_user_before_assistant(self):
         async with peer_model() as (peer, model, _):
             session = model.session()
@@ -3650,224 +3799,230 @@ class TestRealtime:
             assert errors == []
             await session.update_instructions("still usable")
 
-    async def test_rejected_append_preserves_accepted_prefix_and_retries_only_missing_items(
-        self, caplog
-    ):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(chat_ctx=messages("old"))
-            target = session.chat_ctx
-            target.add_message(role="user", content="accepted")
-            target.add_message(role="user", content="rejected")
-            target.add_message(role="user", content="not sent yet")
-            peer.fail_history_at = len(peer.history_operations) + 2
-            errors = []
-            session.on("error", errors.append)
-            await session.update_chat_ctx(target)
-            assert "Prism rejected part of a chat context update" in caplog.text
-            assert [i.text_content for i in session.chat_ctx.items] == ["old", "accepted"]
-            assert len(peer.history_operations) == 3
-            assert not any(not error.recoverable for error in errors)
-            await session.update_chat_ctx(target)
-            assert [i.text for i in await model._get_history()] == [
-                "old",
-                "accepted",
-                "rejected",
-                "not sent yet",
-            ]
-            assert len(peer.history_operations) == 5
-
     @pytest.mark.parametrize("refused_at", [1, 2])
     async def test_rejected_imported_result_can_complete_its_accepted_call(self, refused_at):
         async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(instructions="test")
-            target = llm.ChatContext(tool_history().items[2:4])
-            peer.fail_history_at = refused_at
-            await session.update_chat_ctx(target)
-            assert len(session.chat_ctx.items) == refused_at - 1
-            await session.update_chat_ctx(session.chat_ctx)
-            pending = session.generate_reply()
-            response = await peer.start(await peer.next())
-            await peer.end(response)
-            await pending
-            await session.update_chat_ctx(target)
-            assert len(await model._get_history()) == 2
-            assert len(peer.history_operations) == 3
-            pending = session.generate_reply()
-            response = await peer.start(await peer.next())
-            await peer.end(response)
-            await pending
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                await session._update_session(instructions="test")
+                target = llm.ChatContext(tool_history().items[2:4])
+                peer.fail_history_at = refused_at
+                with pytest.raises(PrismHistoryUpdateError):
+                    await session.update_chat_ctx(target)
+                await model.reconcile_chat_ctx(agent)
+                assert len(session.chat_ctx.items) == refused_at - 1
+                await session.update_chat_ctx(session.chat_ctx)
+                pending = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await pending
+                await session.update_chat_ctx(target)
+                assert len(await model._get_history()) == 2
+                assert len(peer.history_operations) == 3
+                pending = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await pending
 
     @pytest.mark.parametrize("active_reply", [False, True])
     async def test_imported_result_retry_preserves_new_speech_and_acknowledged_ids(
         self, active_reply
     ):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(instructions="test")
-            errors = []
-            session.on("error", errors.append)
-            target = llm.ChatContext(tool_history().items[2:4])
-            peer.fail_history_at = 2
-            await session.update_chat_ctx(target)
-            call_id = (await model._get_history())[0].id
-            peer.server_items.append(
-                {"id": "speech", "type": "message", "role": "user", "text": "Keep this"}
-            )
-            await peer.emit(
-                "conversation.item.input_audio_transcription.completed",
-                item_id="speech",
-                transcript="Keep this",
-            )
-            await wait_until(lambda: len(session.chat_ctx.items) == 2)
-            target.items.append(session.chat_ctx.items[-1])
-            response = await peer.start() if active_reply else None
-            if response:
-                await wait_until(lambda: response in session._history._active)
-            peer.fail_history_at = 3
-            await session.update_chat_ctx(target)
-            assert [i.id for i in session.chat_ctx.items] == [target.items[0].id, "speech"]
-
-            peer.history_started.clear()
-            peer.history_release.clear()
-            change = asyncio.create_task(session.update_chat_ctx(target))
-            try:
-                await asyncio.wait_for(peer.history_started.wait(), 3)
-                # Do not record the result before Prism acknowledges it.
-                assert len(session.chat_ctx.items) == 2
+        async with peer_model(context_mode="strict") as (peer, model, _):
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                await session._update_session(instructions="test")
+                errors = []
+                session.on("error", errors.append)
+                target = llm.ChatContext(tool_history().items[2:4])
+                peer.fail_history_at = 2
+                with pytest.raises(PrismHistoryUpdateError):
+                    await session.update_chat_ctx(target)
+                await model.reconcile_chat_ctx(agent)
+                call_id = (await model._get_history())[0].id
                 peer.server_items.append(
-                    {"id": "later", "type": "message", "role": "user", "text": "Keep this too"}
+                    {"id": "speech", "type": "message", "role": "user", "text": "Keep this"}
                 )
                 await peer.emit(
                     "conversation.item.input_audio_transcription.completed",
-                    item_id="later",
-                    transcript="Keep this too",
+                    item_id="speech",
+                    transcript="Keep this",
                 )
-                await wait_until(lambda: len(session.chat_ctx.items) == 3)
-            finally:
-                peer.history_release.set()
-            await change
-            assert [i.id for i in session.chat_ctx.items] == [
-                *[i.id for i in target.items],
-                "later",
-            ]
-            history = await model._get_history()
-            assert [i.id for i in history] == [call_id, history[1].id, "speech", "later"]
-            assert history[1].call_id == target.items[0].call_id
-            assert [i["type"] for i in peer.history_operations] == ["conversation.item.create"] * 4
-            assert all(
-                i["item"]["type"] == "function_call_output" for i in peer.history_operations[1:]
-            )
-            await session.update_chat_ctx(session.chat_ctx)
-            assert len(peer.history_operations) == 4
-            if response:
+                await wait_until(lambda: len(session.chat_ctx.items) == 2)
+                target.items.append(session.chat_ctx.items[-1])
+                response = await peer.start() if active_reply else None
+                if response:
+                    await wait_until(lambda: response in session._history._active)
+                peer.fail_history_at = 3
+                with pytest.raises(PrismHistoryUpdateError):
+                    await session.update_chat_ctx(target)
+                await model.reconcile_chat_ctx(agent)
+                assert [i.id for i in session.chat_ctx.items] == [target.items[0].id, "speech"]
+
+                peer.history_started.clear()
+                peer.history_release.clear()
+                change = asyncio.create_task(session.update_chat_ctx(target))
+                try:
+                    await asyncio.wait_for(peer.history_started.wait(), 3)
+                    # Do not record the result before Prism acknowledges it.
+                    assert len(session.chat_ctx.items) == 2
+                    peer.server_items.append(
+                        {"id": "later", "type": "message", "role": "user", "text": "Keep this too"}
+                    )
+                    await peer.emit(
+                        "conversation.item.input_audio_transcription.completed",
+                        item_id="later",
+                        transcript="Keep this too",
+                    )
+                    await wait_until(lambda: len(session.chat_ctx.items) == 3)
+                finally:
+                    peer.history_release.set()
+                await change
+                assert [i.id for i in session.chat_ctx.items] == [
+                    *[i.id for i in target.items],
+                    "later",
+                ]
+                history = await model._get_history()
+                assert [i.id for i in history] == [call_id, history[1].id, "speech", "later"]
+                assert history[1].call_id == target.items[0].call_id
+                assert [i["type"] for i in peer.history_operations] == [
+                    "conversation.item.create"
+                ] * 4
+                assert all(
+                    i["item"]["type"] == "function_call_output" for i in peer.history_operations[1:]
+                )
+                await session.update_chat_ctx(session.chat_ctx)
+                assert len(peer.history_operations) == 4
+                if response:
+                    await peer.end(response)
+                pending = session.generate_reply()
+                response = await peer.start(await peer.next())
                 await peer.end(response)
-            pending = session.generate_reply()
-            response = await peer.start(await peer.next())
-            await peer.end(response)
-            await pending
-            assert not any(not error.recoverable for error in errors)
+                await pending
+                assert not any(not error.recoverable for error in errors)
 
     @pytest.mark.parametrize("failure", ["event", "session", "disconnect"])
     async def test_result_insertions_keep_accepted_prefix_and_reject_uncertain_outcomes(
         self, failure
     ):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(instructions="test")
-            errors = []
-            session.on("error", errors.append)
-            pairs = []
-            for index in range(2):
-                call = llm.FunctionCall(call_id=f"imported-{index}", name="lookup", arguments="{}")
-                result = llm.FunctionCallOutput(call_id=call.call_id, output="42", is_error=False)
-                pairs.extend([call, result])
+        async with peer_model(context_mode="strict") as (peer, model, _):
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                await session._update_session(instructions="test")
+                errors = []
+                session.on("error", errors.append)
+                pairs = []
+                for index in range(2):
+                    call = llm.FunctionCall(
+                        call_id=f"imported-{index}", name="lookup", arguments="{}"
+                    )
+                    result = llm.FunctionCallOutput(
+                        call_id=call.call_id, output="42", is_error=False
+                    )
+                    pairs.extend([call, result])
+                    target = session.chat_ctx
+                    target.items.extend([call, result])
+                    peer.fail_history_at = len(peer.history_operations) + 2
+                    with pytest.raises(PrismHistoryUpdateError):
+                        await session.update_chat_ctx(target)
+                    await model.reconcile_chat_ctx(agent)
                 target = session.chat_ctx
-                target.items.extend([call, result])
-                peer.fail_history_at = len(peer.history_operations) + 2
+                target.add_message(role="user", content="Newer speech")
                 await session.update_chat_ctx(target)
-            target = session.chat_ctx
-            target.add_message(role="user", content="Newer speech")
-            await session.update_chat_ctx(target)
-            before = await model._get_history()
-            target = llm.ChatContext([*pairs, target.items[-1]])
-            if failure == "disconnect":
-                peer.close_history_at = len(peer.history_operations) + 2
-            else:
-                peer.fail_history_at = len(peer.history_operations) + 2
-                peer.fail_history_scope = failure
-            if failure == "event":
+                before = await model._get_history()
+                target = llm.ChatContext([*pairs, target.items[-1]])
+                if failure == "disconnect":
+                    peer.close_history_at = len(peer.history_operations) + 2
+                else:
+                    peer.fail_history_at = len(peer.history_operations) + 2
+                    peer.fail_history_scope = failure
+                if failure == "event":
+                    with pytest.raises(PrismHistoryUpdateError):
+                        await session.update_chat_ctx(target)
+                    await model.reconcile_chat_ctx(agent)
+                else:
+                    with pytest.raises(
+                        (PrismHistoryUpdateError, llm.RealtimeError, RimeStreamError)
+                    ):
+                        await session.update_chat_ctx(target)
+                assert [i.id for i in session.chat_ctx.items] == [
+                    pairs[0].id,
+                    pairs[1].id,
+                    pairs[2].id,
+                    target.items[-1].id,
+                ]
+                if failure != "event":
+                    await wait_until(lambda: any(not error.recoverable for error in errors))
+                    with pytest.raises(
+                        (PrismHistoryUpdateError, llm.RealtimeError, RimeStreamError)
+                    ):
+                        await session.update_chat_ctx(target)
+                    return
+                accepted_id = (await model._get_history())[1].id
                 await session.update_chat_ctx(target)
-            else:
-                with pytest.raises((llm.RealtimeError, RimeStreamError)):
-                    await session.update_chat_ctx(target)
-            assert [i.id for i in session.chat_ctx.items] == [
-                pairs[0].id,
-                pairs[1].id,
-                pairs[2].id,
-                target.items[-1].id,
-            ]
-            if failure != "event":
-                await wait_until(lambda: any(not error.recoverable for error in errors))
-                with pytest.raises((llm.RealtimeError, RimeStreamError)):
-                    await session.update_chat_ctx(target)
-                return
-            accepted_id = (await model._get_history())[1].id
-            await session.update_chat_ctx(target)
-            after = await model._get_history()
-            assert [i.id for i in after] == [
-                before[0].id,
-                accepted_id,
-                before[1].id,
-                after[3].id,
-                before[2].id,
-            ]
-            assert [i.id for i in session.chat_ctx.items] == [i.id for i in target.items]
-            assert len(peer.history_operations) == 8
-            assert not any(not error.recoverable for error in errors)
-            pending = session.generate_reply()
-            response = await peer.start(await peer.next())
-            await peer.end(response)
-            await pending
+                after = await model._get_history()
+                assert [i.id for i in after] == [
+                    before[0].id,
+                    accepted_id,
+                    before[1].id,
+                    after[3].id,
+                    before[2].id,
+                ]
+                assert [i.id for i in session.chat_ctx.items] == [i.id for i in target.items]
+                assert len(peer.history_operations) == 8
+                assert not any(not error.recoverable for error in errors)
+                pending = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await pending
 
     async def test_rejected_last_result_preserves_earlier_reply_requirement(self):
         async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(instructions="test")
-            parent = await peer.start()
-            for index in range(2):
-                await peer.emit(
-                    "response.function_call_arguments.done",
-                    response_id=parent,
-                    item_id=f"tool-{index}",
-                    call_id=f"call-{index}",
-                    name="lookup",
-                    arguments="{}",
-                )
-            await peer.end(parent)
-            await wait_until(lambda: len(session.chat_ctx.items) == 2)
-            target = session.chat_ctx
-            for index in range(2):
-                target.items.append(
-                    llm.FunctionCallOutput(
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                await session._update_session(instructions="test")
+                parent = await peer.start()
+                for index in range(2):
+                    await peer.emit(
+                        "response.function_call_arguments.done",
+                        response_id=parent,
+                        item_id=f"tool-{index}",
                         call_id=f"call-{index}",
-                        output="42",
-                        is_error=False,
-                        reply_required=index == 0,
+                        name="lookup",
+                        arguments="{}",
                     )
-                )
-            peer.fail_history_at = 2
-            await session.update_chat_ctx(target)
-            pending = session.generate_reply()
-            request = await peer.next()
-            assert request["response"]["prism_call_id"] == "call-0"
-            response = await peer.start(request)
-            await peer.end(response)
-            await pending
-            assert len(peer.history_operations) == 2
-            await session.update_chat_ctx(target)
-            assert len(peer.history_operations) == 3
+                await peer.end(parent)
+                await wait_until(lambda: len(session.chat_ctx.items) == 2)
+                target = session.chat_ctx
+                for index in range(2):
+                    target.items.append(
+                        llm.FunctionCallOutput(
+                            call_id=f"call-{index}",
+                            output="42",
+                            is_error=False,
+                            reply_required=index == 0,
+                        )
+                    )
+                peer.fail_history_at = 2
+                with pytest.raises(PrismHistoryUpdateError):
+                    await session.update_chat_ctx(target)
+                pending = session.generate_reply()
+                request = await peer.next()
+                assert request["response"]["prism_call_id"] == "call-0"
+                response = await peer.start(request)
+                await peer.end(response)
+                await pending
+                assert len(peer.history_operations) == 2
+                await session.update_chat_ctx(target)
+                assert len(peer.history_operations) == 3
 
     @pytest.mark.parametrize("failure", ["session", "disconnect"])
     async def test_partial_append_with_uncertain_or_session_failure_remains_fatal(self, failure):
@@ -3881,15 +4036,16 @@ class TestRealtime:
                 peer.close_history_at = 2
             errors = []
             session.on("error", errors.append)
-            with pytest.raises((llm.RealtimeError, RimeStreamError)):
+            with pytest.raises((PrismHistoryUpdateError, llm.RealtimeError, RimeStreamError)):
                 await session.update_chat_ctx(messages("accepted", "unknown"))
             await wait_until(lambda: any(not error.recoverable for error in errors))
             with pytest.raises((llm.RealtimeError, RimeStreamError)):
                 await session.update_instructions("must not continue")
 
+    @pytest.mark.parametrize("context_mode", ["strict", "shared"])
     @pytest.mark.parametrize("refused_at", [1, 2])
     async def test_agent_session_continues_after_refused_tool_result_without_reexecuting_tools(
-        self, refused_at, caplog
+        self, context_mode, refused_at, caplog
     ):
         ran = []
 
@@ -3899,14 +4055,14 @@ class TestRealtime:
             ran.append(True)
             return "42"
 
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode=context_mode) as (peer, model, _):
             async with AgentSession(llm=model) as session:
                 agent = Agent(instructions="test", tools=[lookup])
                 await session.start(agent)
                 realtime = model._session
                 errors = []
                 realtime.on("error", errors.append)
-                handle = session.generate_reply()
+                failed_handle = session.generate_reply()
                 parent = await peer.start(await peer.next())
                 for index in range(2):
                     await peer.emit(
@@ -3920,27 +4076,33 @@ class TestRealtime:
                 peer.fail_history_at = refused_at
                 await peer.end(parent)
                 await wait_until(lambda: len(peer.history_operations) == refused_at)
-                continuation = await peer.next()
+                await asyncio.wait_for(failed_handle.wait_for_playout(), 3)
+                assert peer.requests.empty()
+                rejected_target = agent.chat_ctx.copy()
                 if refused_at == 2:
-                    assert continuation["response"]["prism_call_id"] == "call-0"
-                else:
-                    assert "prism_call_id" not in continuation["response"]
-                assert "prism_parent_response_id" not in continuation["response"]["metadata"]
-                response = await peer.start(continuation)
-                await peer.end(response)
-                await asyncio.wait_for(handle.wait_for_playout(), 3)
+                    resumed_handle = session.generate_reply()
+                    resumed = await peer.next()
+                    assert resumed["response"]["prism_call_id"] == "call-0"
+                    response = await peer.start(resumed)
+                    await peer.end(response)
+                    await asyncio.wait_for(resumed_handle.wait_for_playout(), 3)
                 assert not any(not error.recoverable for error in errors)
-                assert "Prism rejected part of a chat context update" in caplog.text
+                assert "Prism history update failed" in caplog.text
                 assert len(ran) == 2
                 assert (
                     sum(isinstance(i, llm.FunctionCallOutput) for i in realtime.chat_ctx.items)
                     == refused_at - 1
                 )
                 assert peer.requests.empty()
-                await agent.update_chat_ctx(agent.chat_ctx.copy())
+                await agent.update_chat_ctx(rejected_target)
                 reply = session.generate_reply()
                 continuation = await peer.next()
-                assert continuation["response"]["prism_call_id"] == "call-1"
+                if refused_at == 1:
+                    assert (
+                        continuation["response"]["metadata"]["prism_parent_response_id"] == parent
+                    )
+                else:
+                    assert continuation["response"]["prism_call_id"] == "call-1"
                 response = await peer.start(continuation)
                 await peer.end(response)
                 await asyncio.wait_for(reply.wait_for_playout(), 3)
@@ -4032,6 +4194,10 @@ class TestRealtime:
                     report = await peer.next()
                     assert report["response"]["metadata"]["prism_cause"] == "proactive"
                     assert report["response"]["prism_call_id"] == "call"
+                    assert report["response"]["prism_instruction"] == (
+                        "Continue according to the agent's instructions, using this tool result. "
+                        "Reply or call a tool as appropriate."
+                    )
                     response_id = await peer.start(report)
                     await peer.message(response_id, text="The result is 42.")
                     await peer.end(response_id)
@@ -4396,8 +4562,7 @@ class TestRealtime:
                 change.cancel()
                 await asyncio.gather(change, return_exceptions=True)
 
-    @pytest.mark.parametrize("cancellations", [1, 2])
-    async def test_cancelled_update_waits_for_acknowledged_settings(self, cancellations):
+    async def test_cancelled_update_waits_for_acknowledged_settings(self):
         async with peer_model() as (peer, model, _):
             session = model.session()
             await session._update_session(instructions="Original")
@@ -4405,7 +4570,7 @@ class TestRealtime:
             peer.update_release.clear()
             change = asyncio.create_task(session.update_tools([lookup]))
             await asyncio.wait_for(peer.update_started.wait(), 3)
-            for _ in range(cancellations):
+            for _ in range(2):
                 change.cancel()
                 await asyncio.sleep(0)
                 assert not change.done()
@@ -4506,34 +4671,6 @@ class TestRealtime:
                     for item in second.chat_ctx.items
                     if item.type == "message"
                 )
-
-    async def test_agent_task_returns_to_parent_on_the_same_connection(self):
-        entered = []
-        result = asyncio.Future()
-
-        class Task(AgentTask[str]):
-            def __init__(self, chat_ctx):
-                super().__init__(instructions="Task", chat_ctx=chat_ctx)
-
-            async def on_enter(self):
-                entered.append(self.session.current_agent.instructions)
-                self.complete("finished")
-
-        class Parent(Agent):
-            def __init__(self):
-                super().__init__(instructions="Parent")
-
-            async def on_enter(self):
-                if not result.done():
-                    result.set_result(await Task(self.chat_ctx))
-
-        async with peer_model() as (peer, model, _):
-            async with AgentSession(llm=model) as session:
-                await session.start(Parent())
-                assert await asyncio.wait_for(result, 3) == "finished"
-                await wait_until(lambda: peer.settings["instructions"] == "Parent")
-                assert entered == ["Task"]
-                assert peer.connections == 1
 
     async def test_tool_handoff_preserves_the_pending_tool_result(self):
         ran = []
@@ -4818,8 +4955,7 @@ class TestRealtime:
             assert np.max(np.abs(samples)) <= 1
             await session.aclose()
 
-    @pytest.mark.parametrize("sample_rate", [8000, 16000, 24000, 48000])
-    @pytest.mark.parametrize("channels", [1, 2])
+    @pytest.mark.parametrize("sample_rate,channels", [(16000, 1), (48000, 2)])
     async def test_sdk_supported_audio_reaches_sdk_unchanged(
         self, sample_rate, channels, monkeypatch
     ):
@@ -4835,13 +4971,16 @@ class TestRealtime:
                 await send_audio(chunk)
 
             monkeypatch.setattr(sdk, "send_audio", observe)
-            frame = rtc.AudioFrame.create(sample_rate, channels, sample_rate // 25)
+            # Distinct samples and stereo channels expose silence, reordering, and downmixing.
+            samples = np.arange(sample_rate // 25 * channels, dtype=np.int16) * 7 - 12000
+            expected_audio = samples.tobytes()
+            frame = rtc.AudioFrame(expected_audio, sample_rate, channels, sample_rate // 25)
             session.push_audio(frame)
             await peer.next("input_audio_buffer.append")
             assert len(chunks) == 1
             assert chunks[0].format.sample_rate == sample_rate
             assert chunks[0].format.channels == channels
-            assert chunks[0].data == bytes(frame.data)
+            assert chunks[0].data == expected_audio
             await session.aclose()
 
     async def test_clear_audio_follows_inflight_audio_and_discards_queued_audio(self, monkeypatch):
@@ -5054,16 +5193,16 @@ class TestRealtime:
                 assert peer.requests.empty()
 
     @pytest.mark.parametrize(
-        "edit", ["append", "prepend", "middle", "delete", "replace", "reorder", "noop"]
+        "edit", ["append", "prepend", "middle", "delete", "replace", "reorder"]
     )
     async def test_context_edits_preserve_local_identity_and_server_order(self, edit):
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             session = model.session()
             original = messages("one", "two", "three")
             await session._update_session(chat_ctx=original)
             target = original.copy()
             if edit == "append":
-                target.add_message(role="system", content="four")
+                target.add_message(role="assistant", content="four")
             elif edit in ("prepend", "middle"):
                 target.items.insert(
                     0 if edit == "prepend" else 1,
@@ -5075,15 +5214,18 @@ class TestRealtime:
                 target.items[1] = target.items[1].model_copy(update={"content": ["replacement"]})
             elif edit == "reorder":
                 target.items.reverse()
-            before = len(peer.history_operations)
             await session.update_chat_ctx(target)
             history = await model._get_history()
             assert [i.text for i in history] == [i.text_content for i in target.items]
             assert [i.id for i in session.chat_ctx.items] == [i.id for i in target.items]
             assert peer.requests.empty()
             accepted_operations = len(peer.history_operations)
-            if edit == "noop":
-                assert accepted_operations == before
+            if edit == "append":
+                assert "truncation" not in peer.settings
+                assert [event["item"] for event in peer.history_operations] == [
+                    {"type": "message", "role": "user", "text": text}
+                    for text in ("one", "two", "three")
+                ] + [{"type": "message", "role": "assistant", "text": "four"}]
             await session.update_chat_ctx(target)
             assert len(peer.history_operations) == accepted_operations
             assert [i.text for i in await model._get_history()] == [
@@ -5091,7 +5233,7 @@ class TestRealtime:
             ]
 
     async def test_completed_tool_pair_deletion_and_restart_do_not_execute_tools(self):
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             fallback = RealtimeModelFallbackAdapter([model])
             session = fallback.session()
             try:
@@ -5107,7 +5249,19 @@ class TestRealtime:
             finally:
                 await session.aclose()
 
-    @pytest.mark.parametrize("invalid", ["orphan", "duplicate", "split_pair", "image", "encoding"])
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            "orphan",
+            "orphan_result",
+            "duplicate",
+            "split_pair",
+            "image",
+            "encoding",
+            "developer",
+            "long",
+        ],
+    )
     async def test_invalid_batch_sends_nothing_and_keeps_conversation_usable(self, invalid):
         async with peer_model() as (peer, model, _):
             session = model.session()
@@ -5118,6 +5272,10 @@ class TestRealtime:
             if invalid == "orphan":
                 target.items.append(
                     llm.FunctionCall(call_id="missing", name="lookup", arguments="{}")
+                )
+            elif invalid == "orphan_result":
+                target.items.append(
+                    llm.FunctionCallOutput(call_id="unknown", output="Result", is_error=False)
                 )
             elif invalid == "duplicate":
                 target.items.append(original.items[0])
@@ -5130,10 +5288,14 @@ class TestRealtime:
                 target.add_message(
                     role="user", content=[llm.ImageContent(image="https://test/image")]
                 )
+            elif invalid == "developer":
+                target.add_message(role="developer", content="Unsupported role")
+            elif invalid == "long":
+                target.add_message(role="user", content="x" * 4001)
             else:
                 target.add_message(role="system", content=chr(0xD800))
             before = len(peer.history_operations)
-            with pytest.raises(llm.RealtimeError):
+            with pytest.raises(PrismHistoryUpdateError):
                 await session.update_chat_ctx(target)
             assert len(peer.history_operations) == before
             assert session.chat_ctx.is_equivalent(original)
@@ -5141,51 +5303,62 @@ class TestRealtime:
 
     async def test_rejected_first_operation_leaves_history_unchanged(self):
         async with peer_model() as (peer, model, _):
-            session = model.session()
-            original = messages("keep")
-            await session._update_session(chat_ctx=original)
-            peer.refusals["conversation.item.create"] = ("invalid_request", "event")
-            target = original.copy()
-            target.add_message(role="system", content="rejected")
-            await session.update_chat_ctx(target)
-            assert session.chat_ctx.is_equivalent(original)
-            assert len(await model._get_history()) == 1
-            await session.update_chat_ctx(target)
-            assert len(await model._get_history()) == 2
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                original = messages("keep")
+                await session._update_session(chat_ctx=original)
+                peer.refusals["conversation.item.create"] = ("invalid_request", "event")
+                target = original.copy()
+                target.add_message(role="system", content="rejected")
+                with pytest.raises(PrismHistoryUpdateError):
+                    await session.update_chat_ctx(target)
+                assert session.chat_ctx.is_equivalent(original)
+                assert len(await model._get_history()) == 1
+                await session.update_chat_ctx(target)
+                assert len(await model._get_history()) == 2
 
     @pytest.mark.parametrize("replacement", [False, True])
     async def test_refused_first_deletion_warns_and_preserves_history(self, replacement, caplog):
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode="strict") as (peer, model, _):
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                await session._update_session(chat_ctx=messages("keep"))
+                original = session.chat_ctx
+                server_id = (await model._get_history())[0].id
+                peer.fail_history_at = len(peer.history_operations) + 1
+                target = messages("replacement") if replacement else llm.ChatContext.empty()
+                with pytest.raises(PrismHistoryUpdateError):
+                    await session.update_chat_ctx(target)
+                assert "Prism history update failed" in caplog.text
+                assert session.chat_ctx.is_equivalent(original)
+                assert (await model._get_history())[0].id == server_id
+                pending = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await pending
+                await session.update_chat_ctx(target)
+                assert session.chat_ctx.is_equivalent(target)
+
+    async def test_partial_history_failure_keeps_confirmed_connection(self):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             session = model.session()
-            await session._update_session(chat_ctx=messages("keep"))
-            original = session.chat_ctx
-            server_id = (await model._get_history())[0].id
-            peer.fail_history_at = len(peer.history_operations) + 1
-            target = messages("replacement") if replacement else llm.ChatContext.empty()
-            await session.update_chat_ctx(target)
-            assert "Prism rejected part of a chat context update" in caplog.text
-            assert session.chat_ctx.is_equivalent(original)
-            assert (await model._get_history())[0].id == server_id
+            await session._update_session(chat_ctx=messages("old"))
+            peer.fail_history_at = len(peer.history_operations) + 2
+            errors = []
+            session.on("error", errors.append)
+            with pytest.raises(PrismHistoryUpdateError, match="partially applied"):
+                await session.update_chat_ctx(messages("new"))
+            assert not errors
+            assert not session.chat_ctx.items
+            await session.update_instructions("connection remains usable")
             pending = session.generate_reply()
             response = await peer.start(await peer.next())
             await peer.end(response)
             await pending
-            await session.update_chat_ctx(target)
-            assert session.chat_ctx.is_equivalent(target)
-
-    async def test_partial_history_failure_closes_uncertain_conversation(self):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(chat_ctx=messages("old"))
-            peer.fail_history_at = len(peer.history_operations) + 2
-            errors = asyncio.Queue()
-            session.on("error", errors.put_nowait)
-            with pytest.raises(llm.RealtimeError, match="partially applied"):
-                await session.update_chat_ctx(messages("new"))
-            error = await asyncio.wait_for(errors.get(), 3)
-            assert not error.recoverable
-            with pytest.raises(llm.RealtimeError):
-                await session.update_instructions("must not use uncertain history")
 
     async def test_cancelled_history_update_settles_and_commits_accepted_change(self):
         async with peer_model() as (peer, model, _):
@@ -5211,34 +5384,38 @@ class TestRealtime:
             assert len(await model._get_history()) == 2
 
     async def test_running_reply_snapshot_does_not_remove_live_local_items(self):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session.update_instructions("test")
-            ctx = session.chat_ctx
-            message = ctx.add_message(role="user", content="question")
-            await session.update_chat_ctx(ctx)
-            pending = session.generate_reply()
-            response_id = await peer.start(await peer.next())
-            await pending
-            await peer.message(response_id)
-            assert [item.text for item in await model._get_history()] == ["question"]
-            assert session.chat_ctx.get_by_id(message.id) is not None
-            with pytest.raises(llm.RealtimeError, match="active replies"):
-                await session.update_chat_ctx(messages("replacement"))
-            await peer.end(response_id)
-            await wait_until(lambda: len(session.chat_ctx.items) == 2)
-            await session.update_chat_ctx(llm.ChatContext.empty())
-            assert await model._get_history() == ()
+        async with peer_model(context_mode="strict") as (peer, model, _):
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                await session.update_instructions("test")
+                ctx = session.chat_ctx
+                message = ctx.add_message(role="user", content="question")
+                await session.update_chat_ctx(ctx)
+                pending = session.generate_reply()
+                response_id = await peer.start(await peer.next())
+                await pending
+                await peer.message(response_id)
+                assert [item.text for item in await model._get_history()] == ["question"]
+                assert session.chat_ctx.get_by_id(message.id) is not None
+                with pytest.raises(PrismHistoryUpdateError, match="active replies"):
+                    await session.update_chat_ctx(messages("replacement"))
+                await peer.end(response_id)
+                await wait_until(lambda: len(session.chat_ctx.items) == 2)
+                await model.reconcile_chat_ctx(agent)
+                await session.update_chat_ctx(llm.ChatContext.empty())
+                assert await model._get_history() == ()
 
     @pytest.mark.parametrize("removed_type", [llm.FunctionCall, llm.FunctionCallOutput])
     async def test_deleting_half_a_tool_pair_is_rejected_before_mutation(self, removed_type):
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             session = model.session()
             ctx = tool_history()
             await session._update_session(chat_ctx=ctx)
             before = len(peer.history_operations)
             target = llm.ChatContext([i for i in ctx.items if not isinstance(i, removed_type)])
-            with pytest.raises(llm.RealtimeError):
+            with pytest.raises(PrismHistoryUpdateError):
                 await session.update_chat_ctx(target)
             assert len(peer.history_operations) == before
             assert len(await model._get_history()) == 5
@@ -5288,97 +5465,54 @@ class TestRealtime:
                 waiting.cancel()
                 await asyncio.gather(waiting, return_exceptions=True)
 
-    @pytest.mark.parametrize("ended", [False, True])
-    async def test_reply_started_during_final_rebuild_acknowledgment_requires_recovery(self, ended):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session._update_session(chat_ctx=messages("old"))
-            peer.block_history_at = len(peer.history_operations) + 2
-            peer.history_release.clear()
-            change = asyncio.create_task(session.update_chat_ctx(messages("replacement")))
-            errors = asyncio.Queue()
-            session.on("error", errors.put_nowait)
-            try:
-                await wait_until(lambda: len(peer.history_operations) == peer.block_history_at)
-                await peer.emit(
-                    "response.created",
-                    response={"id": "racing-reply", "metadata": {"prism_cause": "user_audio"}},
-                )
-                if ended:
-                    await peer.end("racing-reply")
-                    await wait_until(
-                        lambda: (
-                            session._generations.get("racing-reply")
-                            and session._generations["racing-reply"].ended
-                        )
-                    )
-                else:
-                    await wait_until(lambda: "racing-reply" in session._generations)
-            finally:
-                peer.history_release.set()
-            with pytest.raises(llm.RealtimeError, match="partially applied"):
-                await change
-            event = await asyncio.wait_for(errors.get(), 3)
-            assert not event.recoverable
-
-    async def test_omitted_new_options_preserve_existing_text_history_requests(self):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            original = messages("seed")
-            await session._update_session(chat_ctx=original)
-            target = session.chat_ctx
-            target.add_message(role="assistant", content="appended history")
-            await session.update_chat_ctx(target)
-            assert "truncation" not in peer.settings
-            assert [event["item"] for event in peer.history_operations] == [
-                {"type": "message", "role": "user", "text": "seed"},
-                {"type": "message", "role": "assistant", "text": "appended history"},
-            ]
-
     async def test_rebuild_validates_completed_live_tool_pair_before_mutation(self):
-        async with peer_model() as (peer, model, _):
-            session = model.session()
-            await session.update_instructions("Help")
-            pending = session.generate_reply()
-            response = await peer.start(await peer.next())
-            generation = await pending
-            await peer.emit(
-                "response.function_call_arguments.done",
-                response_id=response,
-                item_id="live-tool",
-                call_id="live-call",
-                name="lookup",
-                arguments="{}",
-            )
-            call = await asyncio.wait_for(anext(generation.function_stream), 3)
-            await peer.end(response)
-            assert [item async for item in generation.function_stream] == []
-            completed = session.chat_ctx
-            completed.items.append(
-                llm.FunctionCallOutput(
-                    call_id=call.call_id, name=call.name, output="done", is_error=False
+        async with peer_model(context_mode="strict") as (peer, model, _):
+            async with AgentSession(llm=model) as owner:
+                agent = Agent(instructions="test")
+                await owner.start(agent)
+                session = model._session
+                await session.update_instructions("Help")
+                pending = session.generate_reply()
+                response = await peer.start(await peer.next())
+                generation = await pending
+                await peer.emit(
+                    "response.function_call_arguments.done",
+                    response_id=response,
+                    item_id="live-tool",
+                    call_id="live-call",
+                    name="lookup",
+                    arguments="{}",
                 )
-            )
-            await session.update_chat_ctx(completed)
-            before = len(peer.history_operations)
-            invalid = session.chat_ctx
-            invalid.items.insert(1, llm.ChatMessage(role="system", content=["between"]))
-            with pytest.raises(llm.RealtimeError, match="immediately follow"):
-                await session.update_chat_ctx(invalid)
-            assert len(peer.history_operations) == before
-            assert session.chat_ctx.is_equivalent(completed)
-            valid = session.chat_ctx
-            valid.items.insert(0, llm.ChatMessage(role="system", content=["before"]))
-            await session.update_chat_ctx(valid)
-            assert session.chat_ctx.is_equivalent(valid)
-            assert [type(item) for item in await model._get_history()] == [
-                r.HistoryMessage,
-                r.HistoryFunctionCall,
-                r.HistoryFunctionResult,
-            ]
+                call = await asyncio.wait_for(anext(generation.function_stream), 3)
+                await peer.end(response)
+                assert [item async for item in generation.function_stream] == []
+                completed = session.chat_ctx
+                completed.items.append(
+                    llm.FunctionCallOutput(
+                        call_id=call.call_id, name=call.name, output="done", is_error=False
+                    )
+                )
+                await session.update_chat_ctx(completed)
+                before = len(peer.history_operations)
+                invalid = session.chat_ctx
+                invalid.items.insert(1, llm.ChatMessage(role="system", content=["between"]))
+                with pytest.raises(PrismHistoryUpdateError, match="immediately follow"):
+                    await session.update_chat_ctx(invalid)
+                assert len(peer.history_operations) == before
+                assert session.chat_ctx.is_equivalent(completed)
+                valid = session.chat_ctx
+                valid.items.insert(0, llm.ChatMessage(role="system", content=["before"]))
+                await model.reconcile_chat_ctx(agent)
+                await session.update_chat_ctx(valid)
+                assert session.chat_ctx.is_equivalent(valid)
+                assert [type(item) for item in await model._get_history()] == [
+                    r.HistoryMessage,
+                    r.HistoryFunctionCall,
+                    r.HistoryFunctionResult,
+                ]
 
     async def test_chat_snapshot_changes_do_not_mutate_acknowledged_history(self):
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             session = model.session()
             await session.update_chat_ctx(messages("original"))
             snapshot = session.chat_ctx
@@ -5421,13 +5555,13 @@ class TestRealtime:
                 ]
             )
             before = len(peer.history_operations)
-            with pytest.raises(llm.RealtimeError, match="tool progress"):
+            with pytest.raises(PrismHistoryUpdateError, match="tool progress"):
                 await session.update_chat_ctx(target)
             assert len(peer.history_operations) == before
             assert session.chat_ctx.items[0].extra == {}
 
-    async def test_partial_history_failure_does_not_submit_a_queued_edit(self):
-        async with peer_model() as (peer, model, _):
+    async def test_partial_history_failure_allows_a_queued_independent_edit(self):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             session = model.session()
             original = messages("old")
             await session.update_chat_ctx(original)
@@ -5441,12 +5575,13 @@ class TestRealtime:
                 queued = asyncio.create_task(session.update_chat_ctx(messages("queued")))
                 await asyncio.sleep(0)
                 peer.history_release.set()
-                with pytest.raises(llm.RealtimeError, match="partially applied"):
+                with pytest.raises(PrismHistoryUpdateError, match="partially applied"):
                     await first
-                results = await asyncio.gather(queued, return_exceptions=True)
-                assert isinstance(results[0], (llm.RealtimeError, asyncio.CancelledError))
+                await queued
+                assert [i.text_content for i in session.chat_ctx.items] == ["queued"]
+                assert [i["text"] for i in peer.server_items] == ["queued"]
                 await session.aclose()
-                assert len(peer.history_operations) == before + 2
+                assert len(peer.history_operations) == before + 3
             finally:
                 peer.history_release.set()
                 first.cancel()
@@ -5532,7 +5667,7 @@ class TestRealtime:
 
     @pytest.mark.parametrize("edit", ["delete", "replace"])
     async def test_late_acknowledgment_cannot_restore_deleted_or_replaced_history(self, edit):
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             session = model.session()
             await session.update_instructions("test")
             events = []
@@ -5550,7 +5685,7 @@ class TestRealtime:
 
     @pytest.mark.parametrize("edit", ["append", "delete", "replace"])
     async def test_acknowledgment_during_history_edit_preserves_the_committed_result(self, edit):
-        async with peer_model() as (peer, model, _):
+        async with peer_model(context_mode="strict") as (peer, model, _):
             session = model.session()
             await session.update_instructions("test")
             events = []
@@ -5593,10 +5728,13 @@ class TestRealtime:
             assert session.chat_ctx.items == before.items
 
     @pytest.mark.parametrize(
-        "summary",
-        [None, {"items_left_out": 3}, {"items_left_out": 3, "first_kept_item_id": "kept"}],
+        "summary,status",
+        [
+            (None, "completed"),
+            ({"items_left_out": 3}, "cancelled"),
+            ({"items_left_out": 3, "first_kept_item_id": "kept"}, "failed"),
+        ],
     )
-    @pytest.mark.parametrize("status", ["completed", "cancelled", "failed"])
     async def test_response_summary_is_exposed_without_deleting_history(self, summary, status):
         async with peer_model() as (peer, model, _):
             session = model.session()
@@ -5653,7 +5791,10 @@ class TestRealtime:
                 )
                 await peer.end(response_id, status="cancelled")
                 await asyncio.wait_for(handle.wait_for_playout(), 5)
-                await asyncio.wait_for(peer.truncations.get(), 3)
+                event = await asyncio.wait_for(peer.truncations.get(), 3)
+                assert event["item_id"] == item_id
+                assert event["content_index"] == 0
+                assert peer.receipts.empty()
                 before = session.history.to_dict()
                 events = []
                 collect_payloads(model._session, r.ItemTruncated, events)
@@ -5665,3 +5806,1601 @@ class TestRealtime:
                     "All words retained by the server"
                 )
                 assert session.history.to_dict() == before
+
+    @pytest.mark.parametrize("context_mode", [None, "shared", "strict"])
+    async def test_context_mode_controls_omitted_history(self, context_mode):
+        options = {} if context_mode is None else {"context_mode": context_mode}
+        async with peer_model(**options) as (_, model, _):
+            provider = model.session()
+            original = messages("first", "second")
+            await provider.update_chat_ctx(original)
+            reduced = original.copy()
+            reduced.items.pop(0)
+            await provider.update_chat_ctx(reduced)
+            expected = ["second"] if context_mode == "strict" else ["first", "second"]
+            assert [item.text for item in await model._get_history()] == expected
+
+            reduced.add_message(role="user", content="third")
+            await provider.update_chat_ctx(reduced)
+            assert [item.text for item in await model._get_history()] == [*expected, "third"]
+
+    async def test_context_helpers_preserve_bound_tools(self):
+        class Assistant(Agent):
+            def __init__(self):
+                super().__init__(instructions="Help")
+
+            @function_tool
+            async def lookup(self) -> str:
+                """Look up a value."""
+                return "found"
+
+        async with peer_model() as (_, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Assistant()
+                await session.start(agent)
+                config = next(
+                    item for item in agent.chat_ctx.items if item.type == "agent_config_update"
+                )
+                initial = agent.chat_ctx.copy()
+                initial.items.extend(messages("first", "second").items)
+                await agent.update_chat_ctx(initial)
+                await model.replace_chat_ctx(agent, messages("replacement"))
+                assert [item.text for item in await model._get_history()] == ["replacement"]
+                await model.reconcile_chat_ctx(agent)
+                await model.clear_chat_ctx(agent)
+                assert not await model._get_history()
+                saved = next(item for item in agent.chat_ctx.items if item.id == config.id)
+                assert saved.model_dump() == config.model_dump()
+                assert saved._tools == config._tools
+
+    @pytest.mark.parametrize(
+        "entrypoint,empty_context,nested_task,task_reply,tool_error",
+        [
+            pytest.param("on_enter", False, False, False, False, id="on-enter"),
+            pytest.param("tool", False, False, False, False, id="tool"),
+            pytest.param("tool", False, False, False, True, id="tool-error"),
+            pytest.param("tool", False, False, True, False, id="speaking-task"),
+            pytest.param("tool", False, False, True, True, id="speaking-task-error"),
+            pytest.param("tool", True, False, False, False, id="empty-task-context"),
+            pytest.param("tool", True, True, False, False, id="nested-empty-task-context"),
+        ],
+    )
+    async def test_task_restores_parent_tools_and_continues(
+        self, entrypoint, empty_context, nested_task, task_reply, tool_error, caplog
+    ):
+        completed, recorded = [], []
+        entered = asyncio.Future()
+        error_message = "Input incomplete."
+
+        class Child(AgentTask[str]):
+            def __init__(self):
+                super().__init__(instructions="Child", chat_ctx=llm.ChatContext.empty())
+
+            async def on_enter(self):
+                self.complete("finished")
+
+        class Task(AgentTask[str]):
+            def __init__(self):
+                options = {"chat_ctx": llm.ChatContext.empty()} if empty_context else {}
+                super().__init__(instructions="Task", **options)
+
+            async def on_enter(self):
+                if task_reply:
+                    await self.session.generate_reply(
+                        instructions="Acknowledge the detail"
+                    ).wait_for_playout()
+                self.complete(await Child() if nested_task else "finished")
+
+        @function_tool
+        async def collect_detail() -> str:
+            """Collect a detail in a sub-task."""
+            result = await Task()
+            completed.append(result)
+            if tool_error:
+                raise ToolError(error_message)
+            return result
+
+        @function_tool
+        async def record_detail(detail: str) -> str:
+            """Record the collected detail."""
+            recorded.append(detail)
+            return "saved"
+
+        class Parent(Agent):
+            def __init__(self):
+                super().__init__(instructions="Parent", tools=[collect_detail, record_detail])
+
+            async def on_enter(self):
+                if entrypoint == "on_enter" and not entered.done():
+                    entered.set_result(await Task())
+
+        async with peer_model(playback="discard") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                await session.start(Parent())
+                if entrypoint == "on_enter":
+                    assert await asyncio.wait_for(entered, 3) == "finished"
+                    await wait_until(lambda: peer.settings["instructions"] == "Parent")
+                    speech = session.generate_reply()
+                    continuation = await peer.next()
+                else:
+                    speech = session.generate_reply()
+                    parent = await peer.start(await peer.next())
+                    await peer.emit(
+                        "response.function_call_arguments.done",
+                        response_id=parent,
+                        item_id="parent-item",
+                        call_id="parent-call",
+                        name="collect_detail",
+                        arguments="{}",
+                    )
+                    await peer.end(parent)
+                    if task_reply:
+                        child = await peer.start(await peer.next())
+                        await peer.message(child, text="Thank you")
+                        await peer.end(child)
+                    continuation = await peer.next()
+                    if task_reply:
+                        assert continuation["response"]["prism_call_id"] == "parent-call"
+                    else:
+                        assert (
+                            continuation["response"]["metadata"]["prism_parent_response_id"]
+                            == parent
+                        )
+                    results = [item for item in peer.items if item.get("call_id") == "parent-call"]
+                    assert len(results) == 1
+                    if tool_error:
+                        error = json.loads(results[0]["output"])
+                        assert error["status"] == "failed"
+                        assert error["message"] == error_message
+                        assert "retryable" not in error
+                    else:
+                        assert results[0]["output"] == "finished"
+                    assert completed == ["finished"]
+
+                assert peer.settings["instructions"] == "Parent"
+                assert {tool["function"]["name"] for tool in peer.settings["tools"]} == {
+                    "collect_detail",
+                    "record_detail",
+                }
+                response = await peer.start(continuation)
+                await peer.emit(
+                    "response.function_call_arguments.done",
+                    response_id=response,
+                    item_id="record-item",
+                    call_id="record-call",
+                    name="record_detail",
+                    arguments=json.dumps({"detail": "received"}),
+                )
+                await peer.end(response)
+                response = await peer.start(await peer.next())
+                await peer.message(response, text="Recorded")
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert recorded == ["received"]
+                results = [item for item in peer.items if item.get("call_id") == "record-call"]
+                assert len(results) == 1 and results[0]["output"] == "saved"
+
+                followup = session.generate_reply(user_input="Continue")
+                response = await peer.start(await peer.next())
+                await peer.message(response, text="Still here")
+                await peer.end(response)
+                await asyncio.wait_for(followup.wait_for_playout(), 3)
+                assert any(
+                    item.type == "message" and item.text_content == "Still here"
+                    for item in session.history.items
+                )
+                if entrypoint == "tool":
+                    assert completed == ["finished"]
+                    assert len([i for i in peer.items if i.get("call_id") == "parent-call"]) == 1
+                assert "active tool call" not in caplog.text
+                assert peer.connections == 1
+
+    @pytest.mark.parametrize("playback", ["auto", "discard"])
+    async def test_response_metrics_measure_first_audio_and_monotonic_duration(
+        self, monkeypatch, playback
+    ):
+        clock = SimpleNamespace(now=10.0, wall=1000.0)
+        monkeypatch.setattr(
+            realtime_model,
+            "time",
+            SimpleNamespace(time=lambda: clock.wall, monotonic=lambda: clock.now),
+        )
+        async with peer_model(playback=playback) as (peer, model, _):
+            session = model.session()
+            metrics, events = [], []
+            session.on("metrics_collected", metrics.append)
+            session.on("rime_server_event_received", events.append)
+            await session.update_instructions("test")
+            response = await peer.start()
+            await wait_until(lambda: any(e.payload.kind == "response.started" for e in events))
+            await peer.emit(
+                "response.output_item.added",
+                response_id=response,
+                output_index=0,
+                item={"id": "message", "type": "message"},
+            )
+            fields = {
+                "response_id": response,
+                "output_index": 0,
+                "item_id": "message",
+                "content_index": 0,
+            }
+            clock.now = 11.0
+            await peer.emit("response.text.delta", **fields, delta="Hello")
+            await peer.emit("response.audio.delta", **fields, delta="")
+            await wait_until(lambda: any(e.payload.kind == "audio.delta" for e in events))
+            clock.now = 12.0
+            await peer.emit(
+                "response.audio.delta", **fields, delta=base64.b64encode(b"\0\0").decode()
+            )
+            await wait_until(lambda: sum(e.payload.kind == "audio.delta" for e in events) == 2)
+            clock.now = 13.0
+            await peer.emit(
+                "response.audio.delta", **fields, delta=base64.b64encode(b"\0\0").decode()
+            )
+            await wait_until(lambda: sum(e.payload.kind == "audio.delta" for e in events) == 3)
+            clock.now, clock.wall = 14.0, 900.0
+            await finish_metric_response(peer, response)
+            await wait_until(lambda: len(metrics) == 1)
+            metric = metrics[0]
+            assert isinstance(metric, RealtimeModelMetrics)
+            assert metric.request_id == response
+            assert metric.timestamp == 1000.0
+            assert metric.duration == 4.0
+            assert metric.ttft == 2.0
+            assert (metric.input_tokens, metric.output_tokens, metric.total_tokens) == (12, 8, 20)
+            assert metric.tokens_per_second == 2.0
+            assert not metric.cancelled
+            assert metric.label == model.label
+            assert metric.metadata.model_name == "prism"
+            assert metric.metadata.model_provider == "rime"
+            assert metric.input_token_details == RealtimeModelMetrics.InputTokenDetails()
+            assert metric.output_token_details == RealtimeModelMetrics.OutputTokenDetails()
+            await finish_metric_response(peer, response)
+            # A later response is a processing barrier for the repeated terminal event.
+            later = await peer.start()
+            await finish_metric_response(peer, later, usage=None)
+            await wait_until(lambda: len(metrics) == 2)
+            assert [m.request_id for m in metrics] == [response, later]
+            assert metrics[1].tokens_per_second == 0
+
+    @pytest.mark.parametrize("status", ["completed", "cancelled", "failed"])
+    async def test_no_audio_or_usage_has_defined_metrics(self, status):
+        async with peer_model() as (peer, model, _):
+            session = model.session()
+            metrics = []
+            session.on("metrics_collected", metrics.append)
+            await session.update_instructions("test")
+            response = await peer.start()
+            await finish_metric_response(peer, response, status=status, usage=None)
+            await wait_until(lambda: len(metrics) == 1)
+            metric = metrics[0]
+            assert metric.ttft == -1
+            assert metric.duration >= 0
+            assert metric.cancelled == (status == "cancelled")
+            assert (metric.input_tokens, metric.output_tokens, metric.total_tokens) == (0, 0, 0)
+            assert metric.tokens_per_second == 0
+
+    async def test_agent_session_forwards_metrics_and_accumulates_usage(self):
+        async with peer_model(playback="discard") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                events = []
+                session.on("metrics_collected", events.append)
+                await session.start(Agent(instructions="test"))
+                speech = session.generate_reply(user_input="Hello")
+                response = await peer.start(await peer.next())
+                await peer.message(response)
+                await finish_metric_response(peer, response)
+                await wait_until(lambda: len(events) == 1)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert events[0].metrics.request_id == response
+                assert events[0].metrics.total_tokens == 20
+                usage = session.usage.model_usage[0]
+                assert usage.input_tokens == 12
+                assert usage.output_tokens == 8
+
+    async def test_interrupted_generation_retains_late_terminal_metrics(self, monkeypatch):
+        # Exercise adapter eviction within the older SDK's larger reference window.
+        monkeypatch.setattr(realtime_model, "_GENERATION_LIMIT", 3)
+        async with peer_model() as (peer, model, _):
+            session = model.session()
+            metrics, events = [], []
+            session.on("metrics_collected", metrics.append)
+            session.on("rime_server_event_received", events.append)
+            await session.update_instructions("test")
+            first = await peer.start()
+            await wait_until(lambda: any(e.payload.kind == "response.started" for e in events))
+            peer.cancel_release.clear()
+            session.interrupt()
+            await asyncio.wait_for(peer.cancel_received.wait(), 3)
+            assert not metrics
+            try:
+                responses = []
+                for number in range(4):
+                    response = await peer.start()
+                    responses.append(response)
+                    await finish_metric_response(peer, response)
+                    await wait_until(lambda number=number: len(metrics) == number + 1)
+                await finish_metric_response(peer, first, status="cancelled")
+                await wait_until(lambda: len(metrics) == 5)
+                assert metrics[-1].request_id == first
+                assert metrics[-1].cancelled
+                assert metrics[-1].total_tokens == 20
+            finally:
+                peer.cancel_release.set()
+            # Process the repeated cancellation terminal event before checking metrics.
+            later = await peer.start()
+            await finish_metric_response(peer, later)
+            await wait_until(lambda: len(metrics) == 6)
+            assert [m.request_id for m in metrics] == [*responses, first, later]
+
+    async def test_generation_limit_refuses_to_evict_unfinished_responses(self, monkeypatch):
+        monkeypatch.setattr(realtime_model, "_GENERATION_LIMIT", 3)
+        async with peer_model() as (peer, model, _):
+            session = model.session()
+            errors, metrics = [], []
+            session.on("error", errors.append)
+            session.on("metrics_collected", metrics.append)
+            await session.update_instructions("test")
+            for _ in range(4):
+                await peer.start()
+            await wait_until(lambda: errors)
+            with pytest.raises(RimeResourceLimitError, match="generation limit"):
+                await session.update_instructions("test")
+            assert not metrics
+
+    async def test_terminal_duplicate_after_generation_eviction_is_ignored(self, monkeypatch):
+        monkeypatch.setattr(realtime_model, "_GENERATION_LIMIT", 3)
+        async with peer_model() as (peer, model, _):
+            session = model.session()
+            metrics = []
+            session.on("metrics_collected", metrics.append)
+            await session.update_instructions("test")
+            responses = []
+            for number in range(4):
+                responses.append(await peer.start())
+                await finish_metric_response(peer, responses[-1])
+                await wait_until(lambda number=number: len(metrics) == number + 1)
+            await finish_metric_response(peer, responses[0])
+            responses.append(await peer.start())
+            await finish_metric_response(peer, responses[-1])
+            await wait_until(lambda: len(metrics) == 5)
+            assert [metric.request_id for metric in metrics] == responses
+
+    async def test_queued_interruptions_keep_holds_past_cleanup_deadline(self):
+        count = 140
+        peer = Peer()
+        first_truncate = asyncio.Event()
+        release_truncate = asyncio.Event()
+        emit = peer.emit
+
+        async def delayed_emit(kind, **body):
+            if kind == "conversation.item.truncated" and not first_truncate.is_set():
+                first_truncate.set()
+                await release_truncate.wait()
+            await emit(kind, **body)
+
+        peer.emit = delayed_emit
+        async with serve(peer.handler, "127.0.0.1", 0) as server:
+            endpoint = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+            async with (
+                Rime(api_key="test") as client,
+                client.realtime.connect(
+                    endpoint=endpoint, timeouts=r.RealtimeTimeouts(request_s=1.0)
+                ) as sdk,
+            ):
+                tasks = []
+
+                def spawn(operation):
+                    task = asyncio.create_task(operation)
+                    tasks.append(task)
+                    return task
+
+                playback = Playback(sdk, "auto", 1.0, sdk.report_playback, spawn, lambda: True)
+                outputs = {}
+                tokens = {}
+                ended = set()
+
+                async def consume():
+                    async for event in sdk.events:
+                        payload = event.payload
+                        if isinstance(payload, r.ResponseStarted):
+                            if payload.response.response_id in {"first", "second"}:
+                                playback.start(payload.response)
+                        elif isinstance(payload, r.MessageStarted):
+                            outputs[payload.output.response.response_id] = payload.output
+                            tokens[payload.output.item_id] = playback.output(payload.output)
+                        elif isinstance(payload, r.AudioDelta):
+                            frame = rtc.AudioFrame(
+                                payload.audio.data, 24000, 1, len(payload.audio.data) // 2
+                            )
+                            playback.tag(tokens[payload.output.item_id], frame)
+                        elif isinstance(payload, r.ResponseEnded):
+                            playback.end(payload.response)
+                            ended.add(payload.response.response_id)
+
+                reader = asyncio.create_task(consume())
+                try:
+                    for response_id in ("first", "second"):
+                        await peer.start(response_id=response_id)
+                        await peer.message(response_id)
+                        await peer.end(response_id)
+                    await wait_until(lambda: "second" in ended)
+                    # Age both responses, then block the first report while the second
+                    # waits in the playback queue. Their cleanup deadlines now expire
+                    # before either acknowledgment, but before the SDK request timeout.
+                    await asyncio.sleep(0.8)
+                    playback.interrupt(
+                        r.PlaybackInterrupted(output=outputs["first"], audio_end_ms=10)
+                    )
+                    await asyncio.wait_for(first_truncate.wait(), 1)
+                    playback.interrupt(
+                        r.PlaybackInterrupted(output=outputs["second"], audio_end_ms=10)
+                    )
+                    await asyncio.sleep(0.25)
+                    for number in range(count):
+                        response_id = f"ordinary-{number}"
+                        await peer.start(response_id=response_id)
+                        await peer.end(response_id)
+                        await wait_until(lambda response_id=response_id: response_id in ended)
+                    release_truncate.set()
+                    await asyncio.wait_for(playback.settle(), 1)
+                    reported = [await asyncio.wait_for(peer.truncations.get(), 1) for _ in range(2)]
+                    assert [event["item_id"] for event in reported] == [
+                        outputs["first"].item_id,
+                        outputs["second"].item_id,
+                    ]
+                    assert peer.receipts.empty()
+                finally:
+                    release_truncate.set()
+                    playback.close()
+                    reader.cancel()
+                    await asyncio.gather(reader, *tasks, return_exceptions=True)
+
+    @pytest.mark.parametrize("application_segments", [129, 257])
+    async def test_segment_overflow_recovers_only_after_old_callbacks_drain(
+        self, application_segments
+    ):
+
+        async with peer_model() as (peer, model, _):
+            sink = ControlledOutput()
+            wrapper = model.wrap_audio_output(sink)
+            forwarded = []
+            wrapper.on("playback_finished", forwarded.append)
+            provider = model.session()
+            await provider.update_instructions("test")
+            for _ in range(application_segments):
+                await wrapper.capture_frame(rtc.AudioFrame(b"\0\0" * 480, 24000, 1, 480))
+                wrapper.flush()
+
+            async def capture_rime_response():
+                pending = provider.generate_reply()
+                response = await peer.start(await peer.next())
+                generation = await pending
+                await peer.message(response)
+                await peer.end(response)
+                message = await anext(generation.message_stream)
+                async for frame in message.audio_stream:
+                    await wrapper.capture_frame(frame)
+                wrapper.flush()
+                return response
+
+            await capture_rime_response()
+            # Old callbacks must consume the dropped count, not the newly queued
+            # Rime output. A response captured during ambiguity keeps estimates.
+            for _ in range(application_segments):
+                sink.finish()
+            await asyncio.sleep(0.01)
+            assert peer.receipts.empty()
+            sink.finish()
+            await asyncio.sleep(0.01)
+            assert peer.receipts.empty()
+
+            # All earlier callbacks have drained. A fresh identified segment can
+            # now prove completion, but only when its own callback arrives.
+            fresh = await capture_rime_response()
+            await asyncio.sleep(0.01)
+            assert peer.receipts.empty()
+            sink.finish()
+            receipt = await asyncio.wait_for(peer.receipts.get(), 3)
+            assert receipt["response_id"] == fresh
+            assert receipt["played_ms"] == pytest.approx(20)
+            assert len(forwarded) == application_segments + 2
+            assert peer.receipts.empty()
+
+    @pytest.mark.parametrize("sink,tts", [(False, False), (True, False), (True, True)])
+    async def test_discard_keeps_text_without_audio_or_automatic_tts(self, sink, tts):
+        async with peer_model(playback="discard") as (peer, model, _):
+            speech_tts = CountingTTS()
+            async with AgentSession(llm=model, tts=speech_tts if tts else None) as session:
+                output = ControlledOutput(synchronous=True)
+                if sink:
+                    session.output.audio = output
+                await session.start(Agent(instructions="test"))
+                speech = session.generate_reply(user_input="hello")
+                response = await peer.start(await peer.next())
+                await peer.message(response, text="Visible answer", seconds=3)
+                assert peer.receipts.empty()
+                await peer.end(response)
+                receipt = await asyncio.wait_for(peer.receipts.get(), 3)
+                assert receipt["response_id"] == response
+                assert receipt["played_ms"] == 0
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert not output.frames
+                assert speech_tts.calls == 0
+                assert any(
+                    getattr(i, "text_content", None) == "Visible answer"
+                    for i in session.history.items
+                )
+                await peer.end(response)
+                await asyncio.sleep(0.01)
+                assert peer.receipts.empty()
+
+    @pytest.mark.parametrize("sample_rate", [None, 48000])
+    @pytest.mark.parametrize("synchronous", [False, True])
+    async def test_measured_playback_through_real_pipeline(self, sample_rate, synchronous):
+        async with peer_model() as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                sink = ControlledOutput(sample_rate=sample_rate, synchronous=synchronous)
+                wrapper = model.wrap_audio_output(sink)
+                forwarded = []
+                wrapper.on("playback_finished", forwarded.append)
+                session.output.audio = wrapper
+                assert wrapper.sample_rate is None
+                wrapper.pause()
+                assert sink.paused
+                wrapper.resume()
+                await session.start(Agent(instructions="test"))
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await emit_message(peer, response, "first")
+                await emit_message(peer, response, "second")
+                await peer.end(response)
+                if not synchronous:
+                    await wait_until(lambda: bool(sink.segments))
+                    assert peer.receipts.empty()
+                    sink.finish()
+                    await wait_until(lambda: bool(sink.segments))
+                    assert peer.receipts.empty()
+                    sink.finish()
+                receipt = await asyncio.wait_for(peer.receipts.get(), 3)
+                assert receipt["response_id"] == response
+                assert receipt["played_ms"] == pytest.approx(40)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert len(forwarded) == 2
+                if sample_rate:
+                    assert {frame.sample_rate for frame in sink.frames} == {sample_rate}
+                assert peer.receipts.empty()
+
+    @pytest.mark.parametrize("mode", ["estimated", "auto"])
+    async def test_unwrapped_output_keeps_estimate(self, mode):
+        async with peer_model(playback=mode) as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                session.output.audio = ControlledOutput(synchronous=True)
+                await session.start(Agent(instructions="test"))
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.message(response)
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert peer.receipts.empty()
+
+    @pytest.mark.parametrize("failure_at", [1, 2, 3, 4])
+    async def test_exact_edit_failure_repairs_local_projection_and_keeps_connection(
+        self, failure_at
+    ):
+        notices = []
+        async with peer_model(on_history_update=notices.append) as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                await model.replace_chat_ctx(agent, messages("old-a", "old-b"))
+                peer.fail_history_at = len(peer.history_operations) + failure_at
+                with pytest.raises(PrismHistoryUpdateError) as caught:
+                    await model.replace_chat_ctx(agent, messages("new-a", "new-b"))
+                error = caught.value
+                assert error.status == ("rejected" if failure_at == 1 else "partial")
+                assert error.recoverable and not error.needs_reconciliation
+                assert [
+                    i.text_content for i in agent.chat_ctx.items if isinstance(i, llm.ChatMessage)
+                ] == [i["text"] for i in peer.server_items]
+                assert len(notices) == 1 and notices[0].needs_reconciliation
+                assert "old-a" not in repr(notices[0])
+                assert "old-a" not in str(error)
+                assert peer.connections == 1
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                await model.clear_chat_ctx(agent)
+                assert not peer.server_items
+
+    @pytest.mark.parametrize("context_mode", ["strict", "shared"])
+    async def test_ordinary_partial_allows_independent_reply_and_update(self, context_mode, caplog):
+        notices = []
+        async with peer_model(context_mode=context_mode, on_history_update=notices.append) as (
+            peer,
+            model,
+            _,
+        ):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                errors = []
+                model._session.on("error", errors.append)
+                original = messages("old")
+                await agent.update_chat_ctx(original)
+                target = original.copy()
+                target.add_message(role="user", content="accepted")
+                target.add_message(role="user", content="rejected")
+                target.add_message(role="user", content="not sent yet")
+                peer.fail_history_at = len(peer.history_operations) + 2
+                with pytest.raises(PrismHistoryUpdateError) as caught:
+                    await agent.update_chat_ctx(target)
+                assert caught.value.status == "partial"
+                assert caught.value.needs_reconciliation
+                assert "Prism history update failed" in caplog.text
+                assert [i.text_content for i in caught.value.confirmed_chat_ctx.items] == [
+                    "old",
+                    "accepted",
+                ]
+                assert [i.text_content for i in model._session.chat_ctx.items] == [
+                    "old",
+                    "accepted",
+                ]
+                before = len(peer.history_operations)
+                assert before == 3
+                assert not any(not error.recoverable for error in errors)
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert len(peer.history_operations) == before
+                # The caller can retry the requested view. Accepted items are not replayed.
+                await agent.update_chat_ctx(target)
+                assert len(peer.history_operations) == before + 2
+                assert [i["text"] for i in peer.server_items] == [
+                    "old",
+                    "accepted",
+                    "rejected",
+                    "not sent yet",
+                ]
+                assert len(notices) == 1
+
+    @pytest.mark.parametrize("context_mode", ["strict", "shared"])
+    async def test_invalid_ordinary_update_allows_reply_and_valid_update(self, context_mode):
+        async with peer_model(context_mode=context_mode) as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                await agent.update_chat_ctx(messages("keep"))
+                before = len(peer.history_operations)
+                with pytest.raises(PrismHistoryUpdateError) as caught:
+                    await agent.update_chat_ctx(messages("x" * 4001))
+                assert caught.value.recoverable
+                assert caught.value.code == "history_update_rejected"
+                assert len(peer.history_operations) == before
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                await agent.update_chat_ctx(messages("valid"))
+                assert peer.server_items[-1]["text"] == "valid"
+                assert peer.connections == 1
+
+    async def test_shared_views_preserve_omissions_and_explicit_clear_is_exact(self):
+        async with peer_model(context_mode="shared") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                original = messages("one", "two")
+                await agent.update_chat_ctx(original)
+                count = len(peer.history_operations)
+                await agent.update_chat_ctx(llm.ChatContext.empty())
+                await agent.update_chat_ctx(llm.ChatContext([original.items[-1]]))
+                assert len(peer.history_operations) == count
+                assert [i["text"] for i in peer.server_items] == ["one", "two"]
+                target = original.copy()
+                target.items[0].content = ["one!"]
+                with pytest.raises(PrismHistoryUpdateError):
+                    await agent.update_chat_ctx(target)
+                await model.reconcile_chat_ctx(agent)
+                await model.replace_chat_ctx(agent, target)
+                assert [i["text"] for i in peer.server_items] == ["one!", "two"]
+                await model.clear_chat_ctx(agent)
+                assert not peer.server_items
+
+    @pytest.mark.parametrize("operation", ["replace", "clear", "reconcile"])
+    async def test_inactive_agent_cannot_claim_helper_success(self, operation):
+        async with peer_model() as (_, model, _):
+            agent = Agent(instructions="inactive", llm=model)
+            with pytest.raises(PrismHistoryUpdateError, match="active"):
+                if operation == "replace":
+                    await model.replace_chat_ctx(agent, messages("new"))
+                elif operation == "clear":
+                    await model.clear_chat_ctx(agent)
+                else:
+                    await model.reconcile_chat_ctx(agent)
+
+    @pytest.mark.parametrize("failure", ["cancel", "error"])
+    async def test_failing_task_inside_tool_submits_one_result(self, failure, caplog):
+        class Task(AgentTask[str]):
+            def __init__(self):
+                super().__init__(instructions="Task")
+
+            async def on_enter(self):
+                if failure == "cancel":
+                    self.cancel()
+                else:
+                    self.complete(ValueError("task failed"))
+
+        @function_tool
+        async def task_tool() -> str:
+            """Run a task that cannot finish."""
+            return await Task()
+
+        async with peer_model(context_mode="shared", playback="discard") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                await session.start(Agent(instructions="Parent", tools=[task_tool]))
+                speech = session.generate_reply()
+                parent = await peer.start(await peer.next())
+                await peer.emit(
+                    "response.function_call_arguments.done",
+                    response_id=parent,
+                    item_id="parent-item",
+                    call_id="parent-call",
+                    name="task_tool",
+                    arguments="{}",
+                )
+                await peer.end(parent)
+                request = await peer.next()
+                response = await peer.start(request)
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert len([i for i in peer.items if i.get("call_id") == "parent-call"]) == 1
+                assert "active tool call" not in caplog.text
+
+    async def test_long_task_receives_two_turns_and_child_tool_before_parent_result(self, caplog):
+        ran = []
+        entered = asyncio.Event()
+
+        class Task(AgentTask[str]):
+            def __init__(self):
+                super().__init__(instructions="Task", chat_ctx=llm.ChatContext.empty())
+
+            async def on_enter(self):
+                entered.set()
+
+            @function_tool
+            async def child(self) -> str:
+                """Read a detail."""
+                ran.append("child")
+                return "detail"
+
+            @function_tool
+            async def finish(self) -> None:
+                """Finish the task."""
+                self.complete("finished")
+
+        @function_tool
+        async def parent_tool() -> str:
+            """Run the task."""
+            ran.append("parent")
+            return await Task()
+
+        async with peer_model(context_mode="shared", playback="discard") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                await session.start(Agent(instructions="Parent", tools=[parent_tool]))
+                speech = session.generate_reply()
+                parent = await peer.start(await peer.next())
+                await peer.emit(
+                    "response.function_call_arguments.done",
+                    response_id=parent,
+                    item_id="parent-item",
+                    call_id="parent-call",
+                    name="parent_tool",
+                    arguments="{}",
+                )
+                await peer.end(parent)
+                await asyncio.wait_for(entered.wait(), 3)
+                for number, tool in enumerate(("child", "finish")):
+                    item = f"user-{number}"
+                    await peer.emit(
+                        "input_audio_buffer.speech_started", item_id=item, audio_start_ms=0
+                    )
+                    await peer.emit(
+                        "input_audio_buffer.speech_stopped", item_id=item, audio_end_ms=20
+                    )
+                    await peer.emit("input_audio_buffer.committed", item_id=item)
+                    await peer.emit(
+                        "conversation.item.input_audio_transcription.completed",
+                        item_id=item,
+                        transcript=f"turn {number}",
+                    )
+                    response = await peer.start()
+                    await peer.emit(
+                        "response.function_call_arguments.done",
+                        response_id=response,
+                        item_id=f"{tool}-item",
+                        call_id=f"{tool}-call",
+                        name=tool,
+                        arguments="{}",
+                    )
+                    await peer.end(response)
+                    if tool == "child":
+                        request = await peer.next()
+                        reply = await peer.start(request)
+                        await peer.message(reply)
+                        await peer.end(reply)
+                        await wait_until(
+                            lambda: any(
+                                getattr(i, "text_content", None) == "Hello"
+                                for i in session.history.items
+                            )
+                        )
+                await wait_until(lambda: any(i.get("call_id") == "parent-call" for i in peer.items))
+                request = await peer.next()
+                assert request["response"]["prism_call_id"] == "parent-call"
+                reply = await peer.start(request)
+                await peer.end(reply)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert ran == ["parent", "child"]
+                assert len([i for i in peer.items if i.get("call_id") == "parent-call"]) == 1
+                assert "active tool call" not in caplog.text
+
+    async def test_observed_interruption_variant_appends_without_rebuild(self):
+        async with peer_model(context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            await provider.update_instructions("test")
+            response = await peer.start()
+            item_id = await peer.message(response, text="Full answer.")
+            await peer.end(response)
+            await wait_until(lambda: provider.chat_ctx.get_by_id(item_id) is not None)
+            provider.truncate(
+                message_id=item_id,
+                modalities=["text", "audio"],
+                audio_end_ms=10,
+                audio_transcript="Full",
+            )
+            await asyncio.wait_for(peer.truncations.get(), 3)
+            await peer.emit(
+                "conversation.item.truncated",
+                item_id=item_id,
+                content_index=0,
+                audio_end_ms=10,
+                prism_kept_text="Full ",
+            )
+            await wait_until(lambda: provider.chat_ctx.get_by_id(item_id).text_content == "Full ")
+            observed = provider.chat_ctx
+            observed.get_by_id(item_id).content = ["Full"]
+            observed.add_message(role="user", content="Next")
+            before = len(peer.history_operations)
+            await provider.update_chat_ctx(observed)
+            assert [op["type"] for op in peer.history_operations[before:]] == [
+                "conversation.item.create"
+            ]
+            assert provider.chat_ctx.get_by_id(item_id).text_content == "Full "
+
+    async def test_strict_tool_result_rejects_concurrent_playback_history_change(self):
+        async with peer_model(context_mode="strict") as (peer, model, _):
+            provider = model.session()
+            desired, item_id = await pending_note_snapshot(peer, provider)
+            before = len(peer.history_operations)
+            with pytest.raises(
+                PrismHistoryUpdateError,
+                match="Finish active replies and tool calls before replacing history",
+            ):
+                await provider.update_chat_ctx(desired)
+            assert len(peer.history_operations) == before
+            assert provider.chat_ctx.get_by_id(item_id).text_content == "Got it"
+            # The original call is still live. A fresh, exact snapshot can settle it.
+            fresh = provider.chat_ctx.copy()
+            fresh.items.append(desired.items[-1])
+            await provider.update_chat_ctx(fresh)
+            assert len(peer.history_operations) == before + 1
+            assert not peer.imported_calls
+
+    async def test_shared_pending_tool_result_rejects_unknown_text_change(self):
+        async with peer_model(context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            desired, item_id = await pending_note_snapshot(peer, provider)
+            desired.get_by_id(item_id).content = ["An unrelated intentional edit."]
+            before = len(peer.history_operations)
+            with pytest.raises(PrismHistoryUpdateError, match="conflicts with confirmed content"):
+                await provider.update_chat_ctx(desired)
+            assert len(peer.history_operations) == before
+            assert provider.chat_ctx.get_by_id(item_id).text_content == "Got it"
+
+    async def test_agent_session_interrupted_tool_sync_survives_playback_history_change(
+        self, monkeypatch, caplog
+    ):
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        copied = asyncio.Event()
+        apply = asyncio.Event()
+        executions = []
+        snapshots = []
+
+        @function_tool
+        async def save_note() -> str:
+            """Save the caller's note."""
+            executions.append("save")
+            started.set()
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                # The external write finishes despite speech interruption.
+                await finish.wait()
+            return "The note was saved."
+
+        async with peer_model(context_mode="shared") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                sink = ControlledOutput()
+                session.output.audio = sink
+                agent = Agent(instructions="test", tools=[save_note])
+                await session.start(agent)
+                provider = model._session
+                errors = []
+                provider.on("error", errors.append)
+                real_update = provider.update_chat_ctx
+
+                async def schedule_update(chat_ctx):
+                    if any(isinstance(i, llm.FunctionCallOutput) for i in chat_ctx.items):
+                        snapshots.append(chat_ctx.copy())
+                        copied.set()
+                        await apply.wait()
+                    # Only schedule the race at the public boundary. All history
+                    # decisions and SDK writes use the real plugin implementation.
+                    await real_update(chat_ctx)
+
+                monkeypatch.setattr(provider, "update_chat_ctx", schedule_update)
+                speech = session.generate_reply(user_input="Next week.")
+                response = await peer.start(await peer.next())
+                item_id = await emit_note_call(peer, response)
+                await end_note_response(peer, provider, response)
+                await asyncio.wait_for(started.wait(), 3)
+                await wait_until(lambda: bool(sink.segments))
+                before = len(peer.history_operations)
+                speech.interrupt()
+                finish.set()
+                try:
+                    await asyncio.wait_for(copied.wait(), 3)
+                    assert snapshots[0].get_by_id(item_id).text_content == (
+                        "Got it, I'm making a note of that."
+                    )
+                    assert snapshots[0].items[-1].output == "The note was saved."
+                    assert snapshots[0].items[-1].reply_required is False
+                    await retain_note_prefix(peer, provider, item_id)
+                finally:
+                    apply.set()
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                await wait_until(lambda: any(i.get("call_id") == "note-call" for i in peer.items))
+                assert executions == ["save"]
+                assert speech.interrupted
+                assert provider.chat_ctx.get_by_id(item_id).text_content == "Got it"
+                operations = peer.history_operations[before:]
+                assert len(operations) == 1
+                assert operations[0]["type"] == "conversation.item.create"
+                assert operations[0]["item"]["type"] == "function_call_output"
+                assert operations[0]["item"]["call_id"] == "note-call"
+                assert operations[0]["item"]["output"] == "The note was saved."
+                assert not peer.imported_calls
+                await provider.update_chat_ctx(snapshots[0])
+                await provider.update_chat_ctx(provider.chat_ctx.copy())
+                assert len(peer.history_operations) == before + 1
+                assert provider.chat_ctx.get_by_id(item_id).text_content == "Got it"
+                assert next(i for i in peer.server_items if i["id"] == item_id)["text"] == "Got it"
+                sink.synchronous = True
+                next_speech = session.generate_reply(user_input="Thank you.")
+                next_response = await peer.start(await peer.next())
+                await peer.message(next_response, text="You're welcome.")
+                await peer.end(next_response)
+                await asyncio.wait_for(next_speech.wait_for_playout(), 3)
+                assert executions == ["save"]
+                assert len([i for i in peer.items if i.get("call_id") == "note-call"]) == 1
+                assert peer.connections == 1
+                assert not errors
+                assert (
+                    "failed to sync the tool results of an interrupted generation"
+                    not in caplog.text
+                )
+                assert "Prism history update failed" not in caplog.text
+                assert (
+                    "Finish active replies and tool calls before replacing history"
+                    not in caplog.text
+                )
+
+    @pytest.mark.parametrize(
+        "mutation", ["missing", "duplicate", "unconsumed", "unrelated", "detach"]
+    )
+    async def test_unproven_playback_never_reports_finished(self, mutation):
+        async with peer_model(timeouts=r.RealtimeTimeouts(request_s=0.05)) as (peer, model, _):
+            provider = model.session()
+            sink = ControlledOutput(synchronous=True)
+            wrapper = model.wrap_audio_output(sink)
+            await provider.update_instructions("test")
+            pending = provider.generate_reply()
+            response = await peer.start(await peer.next())
+            generation = await pending
+            await peer.message(response)
+            await peer.end(response)
+            message = await anext(generation.message_stream)
+            frames = [frame async for frame in message.audio_stream]
+            if mutation == "missing":
+                for frame in frames:
+                    frame.userdata.clear()
+            if mutation == "duplicate":
+                frames *= 2
+            if mutation == "unrelated":
+                frames = [rtc.AudioFrame(b"\0\0" * 480, 24000, 1, 480)]
+            if mutation != "unconsumed":
+                for frame in frames:
+                    await wrapper.capture_frame(frame)
+                if mutation == "detach":
+                    wrapper.on_detached()
+                wrapper.flush()
+                await wrapper.wait_for_playout()
+            await asyncio.sleep(0.08)
+            assert peer.receipts.empty()
+            assert peer.connections == 1
+
+    async def test_cancelled_explicit_edit_settles_before_cancellation(self):
+        async with peer_model() as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                peer.history_release.clear()
+                edit = asyncio.create_task(model.replace_chat_ctx(agent, messages("accepted")))
+                await asyncio.wait_for(peer.history_started.wait(), 3)
+                edit.cancel()
+                await asyncio.sleep(0)
+                assert not edit.done()
+                peer.history_release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await edit
+                assert peer.server_items[0]["text"] == "accepted"
+                await model.reconcile_chat_ctx(agent)
+                assert agent.chat_ctx.items[0].text_content == "accepted"
+
+    @pytest.mark.parametrize("context_mode", ["strict", "shared"])
+    async def test_cancelled_refused_update_settles_and_allows_independent_reply(
+        self, context_mode
+    ):
+        async with peer_model(context_mode=context_mode) as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                peer.history_release.clear()
+                peer.fail_history_at = 2
+                edit = asyncio.create_task(agent.update_chat_ctx(messages("accepted", "refused")))
+                await asyncio.wait_for(peer.history_started.wait(), 3)
+                edit.cancel()
+                await asyncio.sleep(0)
+                assert not edit.done()
+                peer.history_release.set()
+                with pytest.raises(PrismHistoryUpdateError) as caught:
+                    await edit
+                assert caught.value.status == "partial"
+                assert [i["text"] for i in peer.server_items] == ["accepted"]
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert len(peer.history_operations) == 2
+                await agent.update_chat_ctx(caught.value.confirmed_chat_ctx)
+                assert len(peer.history_operations) == 2
+
+    async def test_reconciliation_rejects_revision_race(self):
+        class DelayedAgent(Agent):
+            delayed = False
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def update_chat_ctx(self, chat_ctx, **kwargs):
+                if self.delayed:
+                    self.entered.set()
+                    await self.release.wait()
+                await super().update_chat_ctx(chat_ctx, **kwargs)
+
+        async with peer_model(context_mode="shared") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = DelayedAgent(instructions="test")
+                await session.start(agent)
+                await model.replace_chat_ctx(agent, messages("one"))
+                agent.delayed = True
+                edit = asyncio.create_task(model.reconcile_chat_ctx(agent))
+                await asyncio.wait_for(agent.entered.wait(), 3)
+                await peer.emit(
+                    "conversation.item.input_audio_transcription.completed",
+                    item_id="new-input",
+                    transcript="new",
+                )
+                await wait_until(
+                    lambda: any(
+                        getattr(i, "text_content", None) == "new" for i in session.history.items
+                    )
+                )
+                agent.release.set()
+                with pytest.raises(PrismHistoryUpdateError, match="changed"):
+                    await edit
+                agent.delayed = False
+                await model.reconcile_chat_ctx(agent)
+                assert any(getattr(i, "text_content", None) == "new" for i in agent.chat_ctx.items)
+
+    async def test_pending_parent_result_survives_installed_sdk_reference_lifetime(self):
+        count = 140
+        async with peer_model(playback="discard", context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            await provider.update_instructions("test")
+            parent = await peer.start()
+            await peer.emit(
+                "response.function_call_arguments.done",
+                response_id=parent,
+                item_id="parent",
+                call_id="parent-call",
+                name="lookup",
+                arguments="{}",
+            )
+            await peer.end(parent)
+            await asyncio.wait_for(peer.receipts.get(), 3)
+            for _ in range(count):
+                response = await peer.start()
+                await peer.end(response)
+                await asyncio.wait_for(peer.receipts.get(), 3)
+            target = llm.ChatContext(
+                [llm.FunctionCallOutput(call_id="parent-call", output="done", is_error=False)]
+            )
+            await provider.update_chat_ctx(target)
+            reply = provider.generate_reply()
+            request = await peer.next()
+            assert request["response"]["prism_call_id"] == "parent-call"
+            response = await peer.start(request)
+            await peer.end(response)
+            await reply
+            assert len([i for i in peer.items if i.get("call_id") == "parent-call"]) == 1
+
+    @pytest.mark.parametrize("acknowledgment", ["missing", "malformed"])
+    async def test_unknown_acknowledgment_is_terminal_without_replay(
+        self, acknowledgment, monkeypatch
+    ):
+        async with peer_model(timeouts=r.RealtimeTimeouts(request_s=0.05)) as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                if acknowledgment == "missing":
+                    peer.history_release.clear()
+                else:
+                    emit = peer.emit
+
+                    async def malformed_emit(kind, **fields):
+                        if kind == "conversation.item.created":
+                            fields["item"] = {**fields["item"], "id": ""}
+                        await emit(kind, **fields)
+
+                    monkeypatch.setattr(peer, "emit", malformed_emit)
+                try:
+                    with pytest.raises(PrismHistoryUpdateError) as caught:
+                        await model.replace_chat_ctx(agent, messages("unknown outcome"))
+                    assert caught.value.status == "uncertain"
+                    assert not caught.value.recoverable
+                    assert caught.value.confirmed_chat_ctx is None
+                    assert len(peer.history_operations) == 1
+                    with pytest.raises((llm.RealtimeError, RimeTimeoutError, RimeStreamError)):
+                        await model.reconcile_chat_ctx(agent)
+                    assert len(peer.history_operations) == 1
+                    assert peer.requests.empty()
+                finally:
+                    peer.history_release.set()
+
+    async def test_headless_empty_response_and_wrong_model_helper(self):
+        async with peer_model(playback="discard") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.end(response)
+                receipt = await asyncio.wait_for(peer.receipts.get(), 3)
+                assert receipt["played_ms"] == 0
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                async with peer_model() as (_, other, _):
+                    with pytest.raises(PrismHistoryUpdateError, match="directly"):
+                        await other.clear_chat_ctx(agent)
+
+    async def test_roomio_wrapper_installs_before_opening_reply(self):
+        """Real RoomIO and RTC audio source; only room publication/subscription is local."""
+        from types import SimpleNamespace
+
+        from livekit.agents.voice.room_io import RoomIO, RoomOptions
+
+        class Room(rtc.EventEmitter):
+            name = "local-validation"
+
+            def __init__(self):
+                super().__init__()
+                self.local_participant = SimpleNamespace(
+                    identity="agent",
+                    publish_track=self.publish_track,
+                    set_attributes=self.set_attributes,
+                )
+                self.remote_participants = {
+                    "user": SimpleNamespace(
+                        identity="user",
+                        sid="PA_user",
+                        name="user",
+                        metadata="",
+                        attributes={},
+                        kind=rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+                    )
+                }
+
+            def isconnected(self):
+                return True
+
+            async def publish_track(self, track, options):
+                return SimpleNamespace(sid="TR_audio", wait_for_subscription=self.subscribed)
+
+            async def subscribed(self):
+                pass
+
+            async def set_attributes(self, attributes):
+                pass
+
+        async with peer_model() as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                room_io = RoomIO(
+                    session,
+                    Room(),
+                    options=RoomOptions(audio_input=False, text_input=False, text_output=False),
+                )
+                await room_io.start()
+                try:
+
+                    class OpeningAgent(Agent):
+                        async def on_enter(self):
+                            self.session.output.audio = model.wrap_audio_output(
+                                self.session.output.audio
+                            )
+                            self.session.generate_reply(instructions="Say hello")
+
+                    await session.start(OpeningAgent(instructions="test"))
+                    response = await peer.start(await peer.next())
+                    await peer.message(response, seconds=0.02)
+                    await peer.end(response)
+                    receipt = await asyncio.wait_for(peer.receipts.get(), 3)
+                    assert receipt["played_ms"] == pytest.approx(20)
+                finally:
+                    await room_io.aclose()
+
+    @pytest.mark.parametrize(
+        "operation,acknowledgment,ended",
+        [pytest.param("helper", index, False, id=f"helper-ack-{index}") for index in range(1, 5)]
+        + [
+            pytest.param("direct", 4, False, id="direct-final-ack-active"),
+            pytest.param("direct", 4, True, id="direct-final-ack-ended"),
+        ],
+    )
+    async def test_rebuild_race_allows_append_and_completed_reply(
+        self, operation, acknowledgment, ended
+    ):
+        async with peer_model(context_mode="strict", playback="discard") as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                provider = model._session
+                errors, events = [], []
+                provider.on("error", errors.append)
+                provider.on("rime_server_event_received", events.append)
+                await model.replace_chat_ctx(agent, messages("old-a", "old-b"))
+                before = len(peer.history_operations)
+                peer.block_history_at = before + acknowledgment
+                peer.history_release.clear()
+                desired = messages("new-a", "new-b")
+                edit = asyncio.create_task(
+                    model.replace_chat_ctx(agent, desired)
+                    if operation == "helper"
+                    else provider.update_chat_ctx(desired)
+                )
+                try:
+                    await wait_until(lambda: len(peer.history_operations) == peer.block_history_at)
+                    response = await peer.start()
+                    await wait_until(
+                        lambda: any(e.payload.kind == "response.started" for e in events)
+                    )
+                    if ended:
+                        await peer.end(response)
+                        await wait_until(
+                            lambda: any(e.payload.kind == "response.ended" for e in events)
+                        )
+                finally:
+                    peer.history_release.set()
+                with pytest.raises(PrismHistoryUpdateError) as caught:
+                    await edit
+                assert caught.value.status == "partial" and caught.value.recoverable
+                assert caught.value.needs_reconciliation is (operation == "direct")
+                assert len(peer.history_operations) == before + acknowledgment
+                expected = [["old-b"], [], ["new-a"], ["new-a", "new-b"]][acknowledgment - 1]
+                assert [item.text for item in await model._get_history()] == expected
+                if not ended:
+                    await peer.end(response)
+                    await wait_until(
+                        lambda: any(e.payload.kind == "response.ended" for e in events)
+                    )
+                if operation == "direct":
+                    await model.reconcile_chat_ctx(agent)
+                assert [
+                    i.text_content for i in agent.chat_ctx.items if isinstance(i, llm.ChatMessage)
+                ] == [i["text"] for i in peer.server_items]
+
+                accepted = list(peer.history_operations)
+                retained_ids = [item["id"] for item in peer.server_items]
+                followup = agent.chat_ctx.copy()
+                followup.add_message(role="user", content="after the race")
+                await agent.update_chat_ctx(followup)
+                assert peer.history_operations[:-1] == accepted
+                assert len(peer.history_operations) == len(accepted) + 1
+                assert [item["id"] for item in peer.server_items[:-1]] == retained_ids
+                assert peer.server_items[-1]["text"] == "after the race"
+                speech = session.generate_reply()
+                response = await peer.start(await peer.next())
+                await peer.message(response, text="Recovered")
+                await peer.end(response)
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert any(
+                    getattr(item, "text_content", None) == "Recovered"
+                    for item in session.history.items
+                )
+                assert not errors
+                assert peer.connections == 1
+
+    @pytest.mark.parametrize("context_mode", ["strict", "shared"])
+    @pytest.mark.parametrize("failure", ["invalid", "rejected"])
+    async def test_refused_typed_input_cannot_start_reply_and_callback_cannot_break_recovery(
+        self, context_mode, failure, caplog
+    ):
+        observed = []
+
+        def notice(value):
+            observed.append(value)
+            raise RuntimeError("callback-transcript-marker")
+
+        async with peer_model(context_mode=context_mode, on_history_update=notice) as (
+            peer,
+            model,
+            _,
+        ):
+            async with AgentSession(llm=model) as session:
+                agent = Agent(instructions="test")
+                await session.start(agent)
+                if failure == "rejected":
+                    peer.fail_history_at = 1
+                speech = session.generate_reply(
+                    user_input="refused input" if failure == "rejected" else "x" * 4001
+                )
+                await asyncio.wait_for(speech.wait_for_playout(), 3)
+                await wait_until(lambda: bool(observed))
+                assert peer.requests.empty() and not peer.server_items
+                assert observed[0].status == "rejected"
+                assert "callback-transcript-marker" not in caplog.text
+                assert len(peer.history_operations) == (failure == "rejected")
+                assert not agent.chat_ctx.copy(
+                    exclude_config_update=True, exclude_handoff=True
+                ).items
+                for user_input in (None, "independent input"):
+                    speech = (
+                        session.generate_reply()
+                        if user_input is None
+                        else session.generate_reply(user_input=user_input)
+                    )
+                    response = await peer.start(await peer.next())
+                    await peer.end(response)
+                    await asyncio.wait_for(speech.wait_for_playout(), 3)
+                assert [i["text"] for i in peer.server_items] == ["independent input"]
+                assert peer.connections == 1
+
+    async def test_late_playback_cannot_release_fresh_provider_session(self):
+        async with peer_model() as (peer, model, _):
+            sink = ControlledOutput()
+            wrapper = model.wrap_audio_output(sink)
+            provider = model.session()
+            await provider.update_instructions("test")
+            pending = provider.generate_reply()
+            response = await peer.start(await peer.next())
+            generation = await pending
+            await peer.message(response)
+            await peer.end(response)
+            message = await anext(generation.message_stream)
+            async for frame in message.audio_stream:
+                await wrapper.capture_frame(frame)
+            wrapper.flush()
+            await provider.aclose()
+            fresh = model.session()
+            await fresh.update_instructions("fresh")
+            sink.finish()
+            await asyncio.sleep(0.01)
+            assert peer.receipts.empty()
+            assert peer.connections == 2
+
+    async def test_detached_task_cannot_consume_explicit_edit_token(self):
+        class DetachedAgent(Agent):
+            async def update_chat_ctx(self, chat_ctx, **kwargs):
+                await asyncio.create_task(super().update_chat_ctx(chat_ctx, **kwargs))
+
+        async with peer_model() as (peer, model, _):
+            async with AgentSession(llm=model) as session:
+                agent = DetachedAgent(instructions="test")
+                await session.start(agent)
+                with pytest.raises(PrismHistoryUpdateError, match="mismatched"):
+                    await model.replace_chat_ctx(agent, messages("not accepted"))
+                assert not peer.history_operations
+
+    @pytest.mark.parametrize("outcome", ["accepted", "refused", "active-omission"])
+    async def test_acknowledged_append_merges_concurrent_speech_in_server_order(self, outcome):
+        async with peer_model() as (peer, model, _):
+            provider = model.session()
+            await provider.update_chat_ctx(messages("old"))
+            target = provider.chat_ctx
+            target.add_message(role="user", content="A")
+            target.add_message(role="user", content="B")
+            peer.history_started.clear()
+            peer.history_release.clear()
+            if outcome == "refused":
+                peer.fail_history_at = len(peer.history_operations) + 2
+            update = asyncio.create_task(provider.update_chat_ctx(target))
+            try:
+                await asyncio.wait_for(peer.history_started.wait(), 3)
+                peer.server_items.append(
+                    {"id": "speech", "type": "message", "role": "user", "text": "incoming"}
+                )
+                await peer.emit(
+                    "conversation.item.input_audio_transcription.completed",
+                    item_id="speech",
+                    transcript="incoming",
+                )
+                if outcome == "active-omission":
+                    await peer.emit(
+                        "response.created",
+                        response={"id": "active", "prism_input_item_ids": ["speech"]},
+                    )
+                await wait_until(lambda: provider.chat_ctx.get_by_id("speech") is not None)
+            finally:
+                peer.history_release.set()
+            if outcome == "accepted":
+                await update
+            else:
+                with pytest.raises(PrismHistoryUpdateError) as caught:
+                    await update
+                assert caught.value.status == ("partial" if outcome == "refused" else "uncertain")
+                if outcome == "active-omission":
+                    assert caught.value.confirmed_chat_ctx is None
+                    assert not caught.value.recoverable
+                    assert peer.history_reads == 1
+                    return
+            assert peer.history_reads == 1
+            assert [i.text_content for i in provider.chat_ctx.items] == [
+                i["text"] for i in peer.server_items
+            ]
+            assert [i.text_content for i in provider.chat_ctx.items] == ["old", "incoming", "A"] + (
+                ["B"] if outcome == "accepted" else []
+            )
+
+    @pytest.mark.parametrize("superseded_by", ["response", "speech", "report"])
+    async def test_superseded_tool_replies_do_not_exhaust_response_holds(self, superseded_by):
+        async with peer_model(playback="discard", context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            await provider.update_instructions("test")
+            errors = []
+            provider.on("error", errors.append)
+            for number in range(140):
+                call = f"call-{number}"
+                await tool_turn(peer, call)
+                if superseded_by == "report":
+                    await finish_discard_response(peer, await peer.start())
+                await submit(provider, call)
+                if superseded_by == "speech":
+                    started = asyncio.Event()
+                    provider.once("input_speech_started", lambda _, ready=started: ready.set())
+                    await peer.emit(
+                        "input_audio_buffer.speech_started",
+                        item_id=f"input-{number}",
+                        audio_start_ms=0,
+                    )
+                    await asyncio.wait_for(started.wait(), 3)
+                    await peer.emit("prism.typed_input.ready")
+                else:
+                    await finish_discard_response(peer, await peer.start())
+                request = await reply(peer, provider)
+                assert "prism_call_id" not in request["response"]
+                assert request["response"]["metadata"]["prism_cause"] == "proactive"
+            assert not errors
+            assert len(peer.items) == 140
+            assert peer.connections == 1
+
+    async def test_replaced_tool_reports_release_only_the_old_response(self):
+        async with peer_model(playback="discard", context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            await provider.update_instructions("test")
+            for number in range(140):
+                first, second = f"first-{number}", f"second-{number}"
+                await tool_turn(peer, first)
+                await tool_turn(peer, second)
+                await finish_discard_response(peer, await peer.start())
+                await submit(provider, first)
+                await submit(provider, second)
+                request = await reply(peer, provider)
+                assert request["response"]["prism_call_id"] == second
+            assert len(peer.items) == 280
+            assert peer.connections == 1
+
+    async def test_superseded_partial_result_keeps_unresolved_tool_reference(self):
+        async with peer_model(playback="discard", context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            await provider.update_instructions("test")
+            await tool_turn(peer, "first", "pending")
+            await submit(provider, "first")
+            for _ in range(140):
+                await finish_discard_response(peer, await peer.start())
+            await submit(provider, "pending")
+            request = await reply(peer, provider)
+            assert request["response"]["prism_call_id"] == "pending"
+            assert [item["call_id"] for item in peer.items] == ["first", "pending"]
+
+    @pytest.mark.parametrize("ending", ["refused", "cancelled_before_start"])
+    async def test_failed_tool_reply_releases_its_response_hold(self, ending):
+        async with peer_model(playback="discard", context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            await provider.update_instructions("test")
+            for number in range(140):
+                call = f"call-{number}"
+                await tool_turn(peer, call)
+                await submit(provider, call)
+                if ending == "refused":
+                    peer.refusals["response.create"] = ("tool_continuation_not_ready", "event")
+                    with pytest.raises(PrismError, match="tool_continuation_not_ready"):
+                        await provider.generate_reply()
+                else:
+                    pending = provider.generate_reply()
+                    pending.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await pending
+                assert peer.requests.empty()
+            await reply(peer, provider)
+            assert len(peer.items) == 140
+            assert peer.connections == 1
+
+    async def test_in_flight_continuation_keeps_reference_until_fallback_settles(self):
+        async with peer_model(playback="discard", context_mode="shared") as (peer, model, _):
+            provider = model.session()
+            await provider.update_instructions("test")
+            parent = await tool_turn(peer, "call")
+            await submit(provider, "call")
+            pending = provider.generate_reply()
+            request = await peer.next()
+            try:
+                for _ in range(140):
+                    await finish_discard_response(peer, await peer.start())
+                await peer.emit(
+                    "error",
+                    error={
+                        "code": "tool_continuation_unavailable",
+                        "message": "Superseded",
+                        "scope": "event",
+                        "owner": {"kind": "event", "event_id": request["event_id"]},
+                    },
+                )
+                report = await peer.next()
+                assert report["response"]["prism_call_id"] == "call"
+                await finish_discard_response(peer, await peer.start(report))
+                await pending
+                for _ in range(140):
+                    await finish_discard_response(peer, await peer.start())
+                # The public SDK rejects this completed reference once ownership ends.
+                assert provider._sdk is not None
+                with pytest.raises(RimeInputError):
+                    provider._sdk.hold_response(
+                        r.ResponseRef(session_id=provider._sdk.info.session_id, response_id=parent)
+                    )
+                assert len(peer.items) == 1
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)

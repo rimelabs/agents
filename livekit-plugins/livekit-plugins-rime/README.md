@@ -1,10 +1,13 @@
 # Rime plugin for LiveKit Agents
 
-Support for voice synthesis with the [Rime](https://rime.ai/) API.
+Support for voice synthesis and speech recognition with [Rime](https://rime.ai/).
 
 See [https://docs.livekit.io/agents/integrations/tts/rime/](https://docs.livekit.io/agents/integrations/tts/rime/) for more information.
 
 ## Installation
+
+TTS supports Python 3.10 or newer. STT requires Python 3.11 or newer, LiveKit Agents
+1.8.10 or newer, and the optional `stt` extra.
 
 ```bash
 pip install livekit-plugins-rime
@@ -13,6 +16,107 @@ pip install livekit-plugins-rime
 ## Pre-requisites
 
 You'll need an API key from Rime. It can be set as an environment variable: `RIME_API_KEY`
+
+## Speech recognition
+
+STT uses the Rime Python SDK and requires Python 3.11 or newer. Install the `stt` extra:
+
+```bash
+pip install 'livekit-plugins-rime[stt]'
+```
+
+The extra installs `livekit-agents>=1.8.10` and `rimelabs-sdk>=0.1.0a18`, which provides
+unary transcription, revised-hypothesis streaming, and append-fragment streaming.
+STT requires core fixes for non-retryable recognition errors. This minimum does not
+apply to the `realtime` extra, which supports LiveKit Agents 1.7.1 or newer.
+On Python 3.10, the SDK dependency is skipped even when the extra is requested;
+upgrade Python to use STT. TTS does not require the SDK.
+
+```python
+from livekit.agents import AgentSession
+from livekit.plugins import rime, silero
+
+session = AgentSession(
+    vad=silero.VAD.load(),
+    stt=rime.STT(
+        language="en",
+        mode="written",  # or "verbatim" for spoken forms
+        context_terms=["LiveKit", "Rime"],
+    ),
+    # Configure your LLM and TTS as usual.
+)
+```
+
+Install `livekit-plugins-silero` to use the VAD in this example. LiveKit automatically wraps
+this non-streaming recognizer with `stt.StreamAdapter`: VAD detects each completed speech
+segment, then the adapter submits that segment for transcription. Results arrive after the
+segment ends. To receive interim transcripts during speech, enable native streaming below.
+
+For an existing recording, call `await recognizer.recognize(buffer=audio_frame)` with a
+`rtc.AudioFrame` or a list of frames in the same format. The plugin mixes channels to mono,
+resamples to 16 kHz, and sends PCM16 WAV bytes to the SDK. Rime accepts at most 16 MiB of WAV
+audio per request. The result is a `FINAL_TRANSCRIPT` speech event containing the text, resolved
+language, and request ID. Word timestamps, speaker labels, and confidence scores are not supplied.
+
+`language` is explicit (English by default); it is not automatic language detection. Use
+`update_options(language=..., mode=..., context_terms=...)` to change subsequent requests, or
+`recognize(..., language=...)` to override the language for a single request. Session keyterms
+are merged with `context_terms`. LiveKit's STT connection options control the request timeout
+and retries; only SDK timeouts and service-unavailable errors are retried. Close standalone
+recognizers with `await recognizer.aclose()` or use `async with rime.STT(...) as recognizer`.
+
+## Native streaming speech recognition
+
+Pass a VAD directly to `rime.STT` to upload audio while the user speaks. One SDK
+stream handles each VAD utterance. Select `revised_hypotheses` (the default) for
+replacement partials or `append_fragments` for permanent fragments:
+
+```python
+from livekit.agents import APIConnectOptions, AgentSession
+from livekit.agents.voice.agent_session import SessionConnectOptions
+from livekit.plugins import rime, silero
+
+detector = silero.VAD.load()
+session = AgentSession(
+    vad=detector,
+    stt=rime.STT(vad=detector, output_contract="append_fragments"),
+    conn_options=SessionConnectOptions(
+        stt_conn_options=APIConnectOptions(timeout=120, max_retry=0),
+    ),
+    # Configure your LLM and TTS as usual.
+)
+```
+
+Append-fragment support is available in the published `rimelabs-sdk>=0.1.0a18`
+installed by the `stt` extra; no SDK source checkout is required.
+
+The plugin concatenates deltas exactly, preserving spaces and newlines, and sends
+cumulative `INTERIM_TRANSCRIPT` snapshots to LiveKit. Revised hypotheses replace
+the previous snapshot. Only SDK-confirmed completion emits `FINAL_TRANSCRIPT`;
+individual fragments do not end the user turn. Append mode currently uses
+five-second windows, so short utterances may have no update before speech ends.
+Revised mode generally provides earlier provisional text for voice agents.
+
+Use mono input; LiveKit resamples streaming audio to 16 kHz. The VAD must provide
+initial speech frames in `START_OF_SPEECH` and subsequent new frames in
+`INFERENCE_DONE` (as Silero does). The complete `END_OF_SPEECH` buffer is not sent
+again. `flush()` drains the segment and resets the detector; `end_input()` also
+finishes an active utterance. `aclose()` cancels it without creating a final.
+
+Options and merged session keyterms are captured at each utterance start.
+Streaming timeouts include speaking and upload time: use a sufficiently long
+`stt_conn_options.timeout` (the example uses 120 seconds). Live audio is never
+replayed automatically, regardless of `max_retry`. SDK errors retain the request
+ID without including provider messages. Later utterances upload while earlier
+requests finish. Speech boundaries and transcripts are published together in
+utterance order: start, interim updates, final transcript, then end. The end event
+waits for successful transcription; its timestamp still reflects when speech ended.
+While waiting to publish, only the latest cumulative interim snapshot is retained
+per utterance. Supply a VAD to `AgentSession` as shown above for immediate speech
+activity and interruption detection while STT events await earlier results.
+Pending upload audio is bounded to ten seconds across all requests, and at most eight utterances may await completion/publication;
+overflow fails explicitly. SDK/service duration and size limits still
+apply. The caller retains ownership of the supplied VAD.
 
 ## Streaming WebSocket v1 API
 
@@ -133,7 +237,7 @@ Python Rime SDK. Use Python 3.11 or later. TTS still supports Python 3.10.
 uv pip install 'livekit-plugins-rime[realtime]'
 ```
 
-The realtime extra requires `rimelabs-sdk>=0.1.0a26`. For source development:
+The realtime extra requires `rimelabs-sdk>=0.1.0a28`. For source development:
 
 ```sh
 uv sync --package livekit-plugins-rime --extra realtime --inexact
@@ -160,7 +264,7 @@ Create one model per AgentSession and close it when the application finishes.
 
 Use the ordinary `livekit.agents.AgentSession` and
 `livekit.agents.llm.RealtimeModelFallbackAdapter`. The plugin has no replacement
-session, activity, fallback class, or custom audio output.
+session, activity, or fallback class. It provides an optional audio output wrapper.
 
 ```python
 from livekit.agents.llm import RealtimeModelFallbackAdapter
@@ -174,28 +278,36 @@ session = AgentSession(llm=model)
 
 ### LiveKit compatibility
 
-The plugin package requires `livekit-agents>=1.8.10`. The Prism adapter also has
-source compatibility checks against LiveKit 1.7.1, 1.8.6, and 1.8.8 with
-`rimelabs-sdk==0.1.0a26`. These checks load the plugin source directly; they do not
-install this package on older core versions.
+The plugin package requires `livekit-agents>=1.7.1`. Prism requires Python 3.11
+or later and the `realtime` extra. Installation has been validated on LiveKit
+1.7.1 and 1.8.0 through 1.8.10 with `rimelabs-sdk==0.1.0a28`.
+Release version bumps preserve Rime's declared core minimum. Revalidate supported
+core versions before changing that minimum.
+
+Keep the application's LiveKit version pinned when adding the plugin. For example,
+after this change is released:
+
+```sh
+uv add 'livekit-agents==1.7.1' 'livekit-plugins-rime[realtime]'
+```
+
+Until release, install the plugin from the PR commit into a Python 3.11+ virtual
+environment. Replace `<commit>` with its full commit ID:
+
+```sh
+uv pip install --no-sources 'livekit-agents==1.7.1' \
+  'livekit-plugins-rime[realtime] @ git+https://github.com/naszzz/agents.git@<commit>#subdirectory=livekit-plugins/livekit-plugins-rime'
+```
+
+For Git installs, [`--no-sources`](https://docs.astral.sh/uv/concepts/dependencies/#disabling-sources)
+ignores the monorepo's development source overrides. Dependency resolution still
+checks the package requirements and uses the published core version you select.
+Without this flag, uv selects the core from the same Git workspace instead.
 
 LiveKit 1.7.1 fixes active-response cancellation through `SpeechHandle.interrupt()`.
 Versions 1.7.1 through 1.8.5 still ignore realtime `max_tool_steps`, including for
 OpenAI. Use [1.8.6 or later](https://github.com/livekit/agents/pull/7555) if you need
 that limit. Explicit `tool_choice="none"` works on 1.7.1.
-
-Run the source compatibility check from the repository root:
-
-```sh
-uv run --no-project --python 3.11 \
-  --with 'livekit-agents[codecs]==1.7.1' \
-  scripts/test_rime_compatibility.py --core-version 1.7.1
-```
-
-Substitute both version values to test another release. The runner verifies import
-paths and runs all Rime regressions locally without API keys. Three tool-limit
-cases are expected failures before 1.8.6; other failures or skips fail the check.
-Package installation and live services need separate validation.
 
 ### Turns and interruption
 
@@ -204,12 +316,58 @@ speech events and uses LiveKit's standard cancellation and message truncation.
 It requests interruption on caller speech. Early speech hints do not change
 playback volume. There is no custom per-response interruption policy.
 
-The adapter sends no playback completion receipts. Prism estimates playback
-completion from its audio timing plus 1.5 seconds of slack. After caller
-interruption it waits up to 300 ms for a precise position, then uses its estimate.
-Skipped or muted output can therefore delay the next request until the estimate
-expires. LiveKit supplies a truncation position when it interrupts a partially
-played message, including application stops.
+Choose playback behavior when you create the model:
+
+| Option | Behavior |
+| --- | --- |
+| `playback="auto"` (default) | Report measured completion for output identified by the installed wrapper. Use Prism estimates elsewhere. |
+| `playback="estimated"` | Use Prism estimates for normal completion. |
+| `playback="discard"` | Discard audio before frame allocation and output buffering. Report zero played milliseconds at response end. |
+
+All modes retain interruption reporting. Discard keeps text and tools active. It
+keeps the audio capability and an empty audio stream, so LiveKit does not invoke
+an automatic TTS fallback. Explicit application `say()` calls are separate.
+Discard still uses server synthesis, audio transfer, and SDK parsing. It is not
+text-only server generation. Speed depends on the deployment and workload.
+
+For a caller-owned sink, install the wrapper before starting the agent:
+
+```python
+model = rime.realtime.RealtimeModel(context_mode="shared")
+session = AgentSession(llm=model)
+session.output.audio = model.wrap_audio_output(my_audio_sink)
+await session.start(Agent(instructions="Help the caller."))
+```
+
+For RoomIO, install it at the start of `on_enter`, before requesting an opening
+reply. LiveKit sets up RoomIO before it calls `on_enter`:
+
+```python
+class Assistant(Agent):
+    async def on_enter(self):
+        sink = self.session.output.audio
+        if sink is not None:
+            self.session.output.audio = model.wrap_audio_output(sink)
+        self.session.generate_reply(instructions="Greet the caller.")
+
+session = AgentSession(llm=model)
+await session.start(Assistant(instructions="Help the caller."), room=ctx.room)
+```
+
+The wrapper reads frame metadata before downstream resampling. Local protocol
+checks cover the normal AgentSession audio path, 24 kHz and 48 kHz sinks, multiple
+messages, and synchronous completion events. The RoomIO example is tested with
+real RoomIO and an RTC audio source, using local publication and subscription
+substitutes. Actual room transport and device playback need a deployment check. Custom audio nodes must preserve the frame metadata and sample sequence.
+Missing metadata, mixed output, discarded frames, replacement sinks, and missing
+completion events keep estimates in effect. Application TTS and `say()` audio
+cannot release a Prism response. A bare `playback_finished` listener cannot prove
+which response finished.
+
+After generation ends, an unconfirmed output releases its local hold after the
+generated audio duration plus `timeouts.request_s`. This cleanup never reports
+completion. Paused or delayed output can thus return to estimated completion.
+Late events after close cannot report to another provider session.
 
 Text passed to `generate_reply(user_input=...)` is inserted into history before
 a proactive reply request. It is not submitted through Prism's dedicated typed
@@ -221,6 +379,15 @@ as its current input item. Per-reply instructions can accompany this request.
 Tools execute through LiveKit. The adapter submits each result and requests a
 tool continuation. Completed tool history can be loaded into a fresh session;
 resuming a pending tool call in a new session is unsupported.
+
+If a sub-task or newer turn has superseded the tool continuation, the adapter
+requests a reply using the recorded result and the agent's instructions. That
+reply can speak or call another tool; it is not restricted to summarizing the result.
+
+Tool errors retain the application's message and are marked as failures. The
+adapter does not add a retry policy or execute a failed tool again itself.
+With `tool_choice="auto"`, the model chooses whether to speak or call a tool.
+Applications that require another collection attempt should control that workflow.
 
 `tool_choice="auto"` uses the registered tools. `tool_choice="none"` is emulated:
 the adapter clears the server's tools, waits for acknowledgment, requests the
@@ -264,26 +431,122 @@ An imported result must immediately follow its call. Images, video, developer
 messages, and tool progress are unsupported. LiveKit configuration and handoff
 records stay local. Importing history does not execute tools or start a reply.
 
-Append, deletion, and insertion of missing imported results preserve retained turns.
-To retry an imported result after newer speech, insert it directly after its
-existing call and keep all other items unchanged and in order. Prism acknowledges
-each result separately. Replacing or reordering history
-rebuilds completed items with new server IDs. A rebuild requires no active reply
-or pending tool call. Prism has no atomic history replacement: replies can see
-intermediate context between operations. An explicit event-scoped refusal during
-an append or result insertion preserves acknowledged items, logs a warning, and
-returns normally. Later items in that update are not sent after the refusal.
-Refusal of the first deletion also logs a warning and preserves the original history.
-Keep the requested context to retry or correct the unaccepted items. Preserve
-newer conversation items and accepted item IDs when retrying. The plugin does not retry
-automatically or execute tools again. The plugin permits new reply requests even
-when a tool result was refused. Prism decides whether to accept those requests,
-and a reply can use history that is missing the refused result. Server-initiated
-speech replies are still controlled by Prism.
+The default `context_mode="shared"` keeps one conversation through agent and task
+handoffs. Ordinary context updates are views of that conversation. Empty or reduced
+views preserve omitted history and the original pending tool call. A task can
+change instructions and tools without removing that call. Recorded generated,
+played, and retained transcript variants do not force a rebuild. Unknown changes
+or insertions are rejected. LiveKit's separate warning about tasks on realtime
+models remains; automatic task-isolated history is not supported.
 
-An unknown request outcome, session failure, or partially applied deletion or
-replacement still ends the session. Standard fallback replays the current agent
-context, which can already contain the requested edit even when Prism rejected it.
+For headless tests, discard audio output:
+
+```python
+model = rime.realtime.RealtimeModel(playback="discard")
+```
+
+Shared mode also preserves omitted messages that were never played. Use an
+explicit edit to remove those messages. Task views and provider history need not
+be equal. Exact edits, including punctuation changes, use these helpers:
+
+```python
+await model.replace_chat_ctx(session.current_agent, target_context)
+await model.clear_chat_ctx(session.current_agent)
+await model.reconcile_chat_ctx(session.current_agent)
+```
+
+**Migration:** shared mode is now the default. Applications that depend on
+`agent.update_chat_ctx()` replacing or clearing provider history must set
+`context_mode="strict"` explicitly, or use the helpers above. Reducing an agent's
+local context in shared mode does not remove that history from Prism's context.
+
+Explicit `context_mode="strict"` retains replacement semantics. Append, prepend,
+middle insertion, deletion, replacement, and reorder are supported. Edits that
+need a rebuild require no active reply or pending call. Prism deletes a completed
+call and its result together. Every write has a separate acknowledgment;
+replacement is not atomic. Use shared mode for tasks inside tools, where LiveKit
+can omit the parent's pending call from the task's context.
+
+Helpers require an active agent that uses this model directly. Pause competing
+local context edits and handoffs during each call. Helpers preserve local
+configuration records and use `exclude_invalid_function_calls=False` so a task's
+smaller tool list cannot strip the parent call. Pending calls cannot be cleared.
+These helpers do not support a model inside a fallback adapter.
+
+`PrismHistoryUpdateError` is an `Exception` with the following fields. Catch this
+concrete type for history update errors. It no longer inherits from
+`llm.RealtimeError`. LiveKit treats that base type as a best-effort input failure
+and can still request a reply. The separate exception stops the operation that
+depends on the failed update, including the reply to rejected typed input.
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `rejected`, `partial`, or `uncertain` |
+| `recoverable` | The known provider state supports later independent operations |
+| `confirmed_chat_ctx` | Detached projection, or `None` for an uncertain outcome |
+| `needs_reconciliation` | Local context may differ; optional reconciliation can repair it |
+
+Error codes are `history_update_rejected`, `history_update_partial`, and
+`history_update_uncertain`. Messages and notice representations exclude transcript
+content. The plugin records each accepted write before the next write. A known
+partial edit keeps the connection open. An acknowledgment timeout or unknown
+write outcome retains the SDK's terminal failure behavior. No mutation is retried.
+If new history items arrive during a write, the plugin makes at most one history
+read to establish their order. If active-item omissions prevent confirmed order,
+the outcome is uncertain. Missing items are never treated as deletions.
+
+Both context modes allow independent replies and updates after a local validation
+failure, explicit provider rejection, or known partial update. Each later update
+starts from confirmed provider history. Strict mode still applies an exact target;
+shared mode still preserves omitted items and rejects conflicting edits.
+
+Local and provider history can differ after a failed update. Reconciliation is
+optional. It restores the confirmed projection locally without provider writes.
+The explicit replacement helper attempts this repair after a known failure, then
+raises the original error. Its `needs_reconciliation` flag becomes false if repair
+succeeds. The synchronous notice describes state before that repair. An event
+that races with repair can prevent it.
+
+For ordinary updates, a synchronous callback can record the failed update and its
+confirmed projection. Applications can choose to repair local context:
+
+```python
+import asyncio
+from livekit.plugins.rime.realtime import PrismHistoryUpdateError
+
+notices = asyncio.Queue()
+model = rime.realtime.RealtimeModel(
+    context_mode="shared", on_history_update=notices.put_nowait,
+)
+session = AgentSession(llm=model)
+
+async def repair_next_update():
+    notice = await notices.get()
+    if notice.recoverable and notice.needs_reconciliation:
+        # Application must first pause competing edits and handoffs.
+        await model.reconcile_chat_ctx(session.current_agent)
+
+try:
+    await model.replace_chat_ctx(session.current_agent, target_context)
+except PrismHistoryUpdateError as error:
+    if error.recoverable and error.needs_reconciliation:
+        await model.reconcile_chat_ctx(session.current_agent)
+    raise
+```
+
+A failed update stops its dependent work. A refused typed input does not start
+its own reply. A later `session.generate_reply()` can start an independent reply
+without repair. Accepted tool results retain their continuation ownership and are
+not submitted or executed again. After a failed tool-result batch, the application
+can submit missing results or request a continuation for an accepted result.
+Reconciliation does not start replies. Provider-initiated speech remains under
+Prism's control. The helpers do not rewrite the session's past event log.
+
+The realtime extra requires SDK alpha28 or later. The plugin uses `hold_response`
+for long tasks and delayed playback beyond 128 responses.
+The SDK retains up to 128 ordinary and 128 protected responses. Active generation,
+unresolved calls, and holds count toward the protected bound. Limit exhaustion
+raises an error instead of evicting a pending owner. No audio is retained by holds.
 
 Set `truncation="auto"`, `truncation="disabled"`, or
 `truncation=RetentionRatio(0.9)` at construction or through `model.update_options()`.
@@ -323,7 +586,27 @@ before the provider acknowledges it, so rejected or cancelled edits can leave
 agent and provider history different. Fallback startup can also return before a
 backup is ready, and a failed restart can emit more than one reconnect event.
 Use a known valid history when starting a replacement session after these errors;
-the plugin does not add its own history rollback or startup failover logic.
+use the direct-model helpers for known history failures. Fallback swaps retain
+their existing dropped-update and startup behavior.
+
+### Response metrics
+
+Each provider `ResponseEnded` event produces one standard LiveKit
+`RealtimeModelMetrics` event. AgentSession forwards it through `metrics_collected`
+and includes its token counts in session usage. Metrics include the response ID,
+provider token counts when available, generation duration, and cancellation status.
+Local interruption waits for the provider's final event so final usage is retained.
+If the connection ends without that event, no completed-response metric is emitted.
+
+`ttft` measures time from response creation to the first nonempty audio chunk
+received, including in discard mode. It is `-1` if no audio arrives. Duration
+ends at the provider's final response event. These timings exclude reply admission
+and device playback; they do not measure end-to-end conversational latency.
+Elapsed times use a monotonic clock.
+
+Missing usage and unavailable audio, text, and cache token breakdowns use
+LiveKit's zero defaults. A zero therefore does not prove that the provider used
+no tokens. Tokens per second uses the reported output tokens and generation duration.
 
 ### Events and limits
 

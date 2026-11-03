@@ -12,8 +12,9 @@ import asyncio
 import math
 import time
 from collections import OrderedDict
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from contextlib import AbstractAsyncContextManager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -28,7 +29,9 @@ from rimelabs_sdk import (
 )
 
 from livekit import rtc
-from livekit.agents import llm, utils
+from livekit.agents import Agent, llm, utils
+from livekit.agents.metrics import RealtimeModelMetrics
+from livekit.agents.metrics.base import Metadata
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
@@ -36,8 +39,33 @@ from livekit.agents.types import (
     NotGivenOr,
 )
 from livekit.agents.utils import is_given
+from livekit.agents.voice.io import AudioOutput
 
-from ._history import HistoryUpdateError, PrismHistory
+from ..log import logger
+from ._history import HistoryUpdateError, HistoryUpdateNotice, PrismHistory
+from ._playback import Playback, PrismAudioOutput, _Output
+
+_GENERATION_LIMIT = 128
+# Prism reports otherwise ask the model to describe the result to the caller.
+# LiveKit expects the agent's workflow to continue, which may require a tool call.
+_TOOL_RESULT_INSTRUCTION = (
+    "Continue according to the agent's instructions, using this tool result. "
+    "Reply or call a tool as appropriate."
+)
+
+
+@dataclass
+class _Edit:
+    session: RealtimeSession
+    operation: Literal["replace", "reconcile"]
+    target: llm.ChatContext
+    task: asyncio.Task[Any] | None
+    revision: int
+    consumed: bool = False
+    active: bool = True
+
+
+_edit: ContextVar[_Edit | None] = ContextVar("rime_history_edit", default=None)
 
 
 def _startup_retryable(error: Exception) -> bool:
@@ -75,6 +103,8 @@ class RealtimeModel(llm.RealtimeModel):
 
     Omit endpoint to use public Prism. An injected Rime client stays caller-owned.
     Otherwise Rime reads RIME_API_KEY. Settings updates wait for acknowledgment.
+    Context updates preserve omitted history by default. Use context_mode="strict"
+    for replacement semantics, or use the explicit history-edit helpers.
     A closed session may be replaced with a fresh conversation, such as an
     explicit fallback restart. Concurrent sessions are unsupported.
     """
@@ -82,6 +112,9 @@ class RealtimeModel(llm.RealtimeModel):
     def __init__(
         self,
         *,
+        playback: Literal["auto", "estimated", "discard"] = "auto",
+        context_mode: Literal["strict", "shared"] = "shared",
+        on_history_update: Callable[[HistoryUpdateNotice], None] | None = None,
         endpoint: str | None = None,
         client: Rime | None = None,
         voice: str | None = None,
@@ -113,6 +146,15 @@ class RealtimeModel(llm.RealtimeModel):
             conn_options.retry_interval
         ):
             raise ValueError("Connection timeout and retry interval must be finite")
+        if playback not in ("auto", "estimated", "discard"):
+            raise ValueError("playback must be auto, estimated, or discard")
+        if context_mode not in ("strict", "shared"):
+            raise ValueError("context_mode must be strict or shared")
+        if on_history_update is not None and not callable(on_history_update):
+            raise ValueError("on_history_update must be callable")
+        self._playback_mode = playback
+        self._context_mode = context_mode
+        self._on_history_update = on_history_update
         self._conn_options = conn_options
         self._startup_timeout = startup_timeout
         self._endpoint = endpoint
@@ -126,6 +168,76 @@ class RealtimeModel(llm.RealtimeModel):
         self._client = client if client is not None else Rime()
         self._owns_client = client is None
         self._session: RealtimeSession | None = None
+        self._wrapped_output = False
+
+    def wrap_audio_output(self, output: AudioOutput) -> AudioOutput:
+        """Install the returned sink through AgentSession.output.audio before playback."""
+        self._wrapped_output = True
+        return PrismAudioOutput(output)
+
+    async def replace_chat_ctx(self, agent: Agent, chat_ctx: llm.ChatContext) -> None:
+        """Apply an exact edit. Pause other local edits and handoffs during this call."""
+        await self._edit_context(agent, chat_ctx, "replace")
+
+    async def clear_chat_ctx(self, agent: Agent) -> None:
+        await self.replace_chat_ctx(agent, llm.ChatContext.empty())
+
+    async def reconcile_chat_ctx(self, agent: Agent) -> None:
+        """Restore confirmed provider history locally, without provider writes."""
+        await self._edit_context(agent, None, "reconcile")
+
+    async def _edit_context(
+        self,
+        agent: Agent,
+        target: llm.ChatContext | None,
+        operation: Literal["replace", "reconcile"],
+    ) -> None:
+        try:
+            owner = agent.session
+        except RuntimeError:
+            raise HistoryUpdateError("The agent must be active on this Rime model") from None
+        model = agent.llm if is_given(agent.llm) else owner.llm
+        session = self._session
+        if owner.current_agent is not agent or model is not self or session is None:
+            raise HistoryUpdateError("The active agent must use this Rime model directly")
+        await asyncio.shield(session._initialized)
+        session._require()
+        history = session._history
+        assert history is not None
+        if operation == "reconcile":
+            target = history.projection(agent.chat_ctx)
+        else:
+            assert target is not None
+            target = target.copy()
+            # Preserve local handoff/configuration records by stable identity.
+            # Keep live tool references; a deep copy can reach the running agent.
+            ids = {item.id for item in target.items}
+            target.items.extend(
+                item.model_copy()
+                for item in agent.chat_ctx.items
+                if not isinstance(item, (llm.ChatMessage, llm.FunctionCall, llm.FunctionCallOutput))
+                and item.id not in ids
+            )
+        token = _Edit(session, operation, target.copy(), asyncio.current_task(), history.revision)
+        scope = _edit.set(token)
+        failure: HistoryUpdateError | None = None
+        try:
+            await agent.update_chat_ctx(target, exclude_invalid_function_calls=False)
+            if not token.consumed or self._session is not session:
+                raise HistoryUpdateError("The live provider did not consume the history operation")
+        except HistoryUpdateError as error:
+            failure = error
+        finally:
+            token.active = False
+            _edit.reset(scope)
+        if failure is not None:
+            if operation == "replace" and failure.recoverable and token.consumed:
+                try:
+                    await self.reconcile_chat_ctx(agent)
+                    failure.needs_reconciliation = False
+                except HistoryUpdateError:
+                    pass
+            raise failure
 
     async def update_options(
         self,
@@ -197,6 +309,7 @@ class _Message:
     played_transcript: str | None = None
     retained_text: str | None = None
     discarded: bool = False
+    token: _Output | None = None
 
 
 @dataclass
@@ -205,6 +318,10 @@ class _Generation:
     event: llm.GenerationCreatedEvent
     messages: utils.aio.Chan[llm.MessageGeneration]
     functions: utils.aio.Chan[llm.FunctionCall]
+    created_timestamp: float
+    created_monotonic: float
+    first_audio_monotonic: float | None = None
+    provider_ended: bool = False
     instruction_item_id: str | None = None
     outputs: dict[str, _Message] = field(default_factory=dict)
     ended: bool = False
@@ -247,6 +364,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
         self._tool_policy_floor = 0
         self._transcript_deltas: dict[str, str] = {}
         self._history: PrismHistory | None = None
+        self._playback: Playback | None = None
         self._instruction_lock = asyncio.Lock()
         self._instruction_items: OrderedDict[str, tuple[str, bool]] = OrderedDict()
         self._spawn(self._connect())
@@ -286,6 +404,14 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
                 return
             assert self._sdk is not None
             self._history = PrismHistory(self._sdk)
+            self._playback = Playback(
+                self._sdk,
+                self._model._playback_mode,
+                self._model._timeouts.request_s,
+                self._report_playback,
+                self._spawn,
+                lambda: self._model._wrapped_output,
+            )
             self._spawn(self._read_events())
             self._initialized.set_result(None)
             self._spawn(self._send_audio())
@@ -297,6 +423,14 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
             self._fatal(error)
 
     async def _open_connection(self) -> None:
+        """Open the SDK session with bounded retries for retryable startup failures.
+
+        Try at most ``max_retry + 1`` times, with ``conn_options.timeout`` per
+        attempt. Retry delays honor the server delay and must fit the startup
+        budget; the caller enforces the overall startup timeout. Cancellation
+        or an attempt timeout cancels the opening task without retrying.
+        Shutdown waits for that task and exits any successfully entered context.
+        """
         options = self._model._conn_options
         deadline = asyncio.get_running_loop().time() + self._model._startup_timeout
         for attempt in range(options.max_retry + 1):
@@ -346,7 +480,14 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
     async def _enter_connection(
         self, connection: AbstractAsyncContextManager[r.RealtimeSession]
     ) -> None:
-        # Store success before delivering it to a waiter that may already be cancelled.
+        """Enter the context and retain its session for shutdown cleanup.
+
+        Store success before returning to a waiter that may already be cancelled.
+        Shutdown waits for this task before exiting a successfully entered context.
+
+        Args:
+            connection: SDK connection context to enter; shutdown owns its exit.
+        """
         self._sdk = await connection.__aenter__()
 
     async def update_instructions(self, instructions: str) -> None:
@@ -472,34 +613,61 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         await asyncio.shield(self._initialized)
+        token = _edit.get()
+        if token is not None:
+            if (
+                not token.active
+                or token.consumed
+                or token.session is not self
+                or token.task is not asyncio.current_task()
+                or token.target.copy(exclude_handoff=True, exclude_config_update=True).items
+                != chat_ctx.copy(exclude_handoff=True, exclude_config_update=True).items
+            ):
+                raise HistoryUpdateError("Expired or mismatched history operation")
+            token.consumed = True
 
         async def apply() -> None:
             self._require()
             assert self._history is not None
-            try:
-                submitted = await self._history.sync(chat_ctx)
-                for ref, output in submitted:
-                    if output.reply_required:
-                        if (
-                            self._latest
-                            and ref.response_id == self._latest.response_id
-                            and not self._history.has_pending_calls(self._latest)
-                        ):
-                            self._parent = self._latest
-                        else:
-                            # SDK continuation waits for every result. A partial
-                            # update can still request a report for an accepted result.
-                            self._report = ref
-            except HistoryUpdateError as error:
-                if error.partial:
+            if token is not None and token.operation == "reconcile":
+                await self._history.reconcile(chat_ctx, token.revision)
+                return
+            result = await self._history.sync(
+                chat_ctx, shared=token is None and self._model._context_mode == "shared"
+            )
+            for ref, output in result.submitted:
+                if output.reply_required:
+                    if (
+                        self._latest
+                        and ref.response_id == self._latest.response_id
+                        and not self._history.has_pending_calls(self._latest)
+                    ):
+                        self._set_tool_reply(self._latest, self._report)
+                    else:
+                        self._set_tool_reply(self._parent, ref)
+                else:
+                    self._release_tool_response(ref)
+            if result.failure is not None:
+                error = result.failure
+                logger.warning("Prism history update failed", extra={"status": error.status})
+                callback = self._model._on_history_update
+                if callback is not None:
+                    try:
+                        callback(
+                            HistoryUpdateNotice(
+                                session_id=self._require().info.session_id,
+                                status=error.status,
+                                recoverable=error.recoverable,
+                                confirmed_chat_ctx=self._history.projection(llm.ChatContext.empty())
+                                if error.recoverable
+                                else None,
+                            )
+                        )
+                    except Exception:
+                        logger.warning("Rime history notice callback failed")
+                if not error.recoverable:
                     self._fatal(error)
-                raise
-            except r.RimeRealtimeError as error:
-                raise PrismError(error.fault) from error
-            except Exception as error:
-                if not isinstance(error, RimeInputError):
-                    self._fatal(error)
-                raise
+                raise error
 
         await self._settle_update(apply())
 
@@ -596,6 +764,25 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
         # chunk finishes before this clear reaches the server.
         self._spawn(self._require().clear_audio())
 
+    def _release_tool_response(self, ref: r.ResponseRef | r.ToolCallRef) -> None:
+        assert self._history is not None
+        if any(
+            staged is not None and staged.response_id == ref.response_id
+            for staged in (self._parent, self._report)
+        ):
+            return
+        if not self._history.has_pending_calls(
+            r.ResponseRef(session_id=ref.session_id, response_id=ref.response_id)
+        ):
+            self._history.release_response(ref.response_id)
+
+    def _set_tool_reply(self, parent: r.ResponseRef | None, report: r.ToolCallRef | None) -> None:
+        previous = (self._parent, self._report)
+        self._parent, self._report = parent, report
+        for ref in previous:
+            if ref is not None:
+                self._release_tool_response(ref)
+
     def generate_reply(
         self,
         *,
@@ -607,18 +794,36 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
         if is_given(tools):
             raise self._unsupported("Prism does not support per-reply tools")
         self.update_options(tool_choice=tool_choice)
-        parent, self._parent = self._parent, None
-        report, self._report = self._report, None
-        return self._spawn(
-            self._reply(
-                instructions if is_given(instructions) and instructions else None,
-                parent,
-                report,
-                self._tool_choice == "none",
-                dict(metadata) if metadata is not None else None,
-            ),
-            request=True,
-        )
+        parent, report = self._parent, self._report
+        holds: list[r.ResponseHold] = []
+        try:
+            # A request owns its references independently of later staged replies.
+            # The callback also releases them if cancelled before its coroutine runs.
+            for ref in (parent, report):
+                if ref is not None:
+                    holds.append(self._require().hold_response(ref))
+            task = self._spawn(
+                self._reply(
+                    instructions if is_given(instructions) and instructions else None,
+                    parent,
+                    report,
+                    self._tool_choice == "none",
+                    dict(metadata) if metadata is not None else None,
+                ),
+                request=True,
+            )
+        except BaseException:
+            for hold in holds:
+                hold.release()
+            raise
+        self._set_tool_reply(None, None)
+
+        def release_holds(_: asyncio.Task[Any]) -> None:
+            for hold in holds:
+                hold.release()
+
+        task.add_done_callback(release_holds)
+        return task
 
     async def _reply(
         self,
@@ -634,6 +839,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
         self._require()
         assert self._history is not None
         await self._history.wait_for_updates()
+        if self._playback is not None:
+            await self._playback.settle()
         try:
             if not disable_tools:
                 return await self._request_reply(instruction, parent, report, metadata)
@@ -704,9 +911,15 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
                     call = self._history.last_call(parent)
                     if call is None:
                         raise
-                    ref = await sdk.request_reply(tool_call=call, metadata=metadata)
+                    ref = await sdk.request_reply(
+                        tool_call=call, instruction=_TOOL_RESULT_INSTRUCTION, metadata=metadata
+                    )
             else:
-                ref = await sdk.request_reply(tool_call=report, metadata=metadata)
+                ref = await sdk.request_reply(
+                    tool_call=report,
+                    instruction=_TOOL_RESULT_INSTRUCTION if report is not None else None,
+                    metadata=metadata,
+                )
             async with self._generation_ready:
                 await self._generation_ready.wait_for(
                     lambda: ref.response_id in self._generations or self._failure is not None
@@ -756,14 +969,10 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
         if is_given(audio_transcript) or audio_end_ms == 0:
             message.played_transcript = audio_transcript if is_given(audio_transcript) else ""
             assert self._history is not None
-            self._history.record_assistant(message_id, message.played_transcript)
-        self._spawn(
-            self._report_playback(
-                r.PlaybackInterrupted(
-                    output=message.output,
-                    audio_end_ms=audio_end_ms,
-                )
-            )
+            self._history.record_assistant(message_id, message.played_transcript, played=True)
+        assert self._playback is not None
+        self._playback.interrupt(
+            r.PlaybackInterrupted(output=message.output, audio_end_ms=audio_end_ms)
         )
 
     async def _cancel(self, response: r.ResponseRef) -> None:
@@ -784,11 +993,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
         try:
             await self._require().report_playback(report)
         except r.RimeRealtimeError as error:
-            if (
-                not isinstance(report, r.PlaybackInterrupted)
-                or error.fault.scope != "event"
-                or error.fault.code != "truncate_not_current"
-            ):
+            if error.fault.scope != "event":
                 raise
             # A newer response owns the playback window; this report changes nothing.
             self._emit_error(error, recoverable=True)
@@ -815,7 +1020,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
         )
         if isinstance(payload, r.SpeechStarted):
             self._latest = None
-            self._parent = None
+            self._set_tool_reply(None, self._report)
             self._turn_started[payload.item_id] = time.time()
             while len(self._turn_started) > 128:
                 self._turn_started.popitem(last=False)
@@ -859,18 +1064,24 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
             self._transcript_deltas.pop(payload.item_id, None)
             self._turn_started.pop(payload.item_id, None)
         elif isinstance(payload, r.ResponseStarted):
+            assert self._playback is not None
+            self._playback.start(payload.response)
             if (
                 payload.settings_revision is not None
                 and payload.settings_revision < self._tool_policy_floor
             ):
                 raise RimeResourceLimitError("Prism response tool policy is no longer retained")
-            if len(self._generations) >= 128:
-                oldest = next(iter(self._generations.values()))
-                if not oldest.ended:
+            if len(self._generations) >= _GENERATION_LIMIT:
+                # Local interruption closes streams before the provider's terminal event.
+                oldest = next(
+                    (key for key, value in self._generations.items() if value.provider_ended),
+                    None,
+                )
+                if oldest is None:
                     raise RimeResourceLimitError(
                         "Prism generation limit reached with an active reply"
                     )
-                self._generations.popitem(last=False)
+                del self._generations[oldest]
             messages = utils.aio.Chan[llm.MessageGeneration](maxsize=128)
             functions = utils.aio.Chan[llm.FunctionCall](maxsize=128)
             created = llm.GenerationCreatedEvent(
@@ -884,6 +1095,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
                 created,
                 messages,
                 functions,
+                created_timestamp=time.time(),
+                created_monotonic=time.monotonic(),
                 instruction_item_id=payload.instruction_item_id,
                 # A speculative speech reply can arrive after a settings update
                 # while still using the older revision's registered tools.
@@ -902,7 +1115,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
                     False,
                 )
             self._latest = self._active = payload.response
-            self._parent = self._report = None
+            self._set_tool_reply(None, None)
             if event.request_id is None:
                 self.emit("generation_created", created)
         elif isinstance(payload, r.ResponseAbandoned):
@@ -911,7 +1124,10 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
             generation = self._generations[payload.output.response.response_id]
             if generation.abandoned:
                 return
-            message = _Message(payload.output)
+            assert self._playback is not None
+            message = _Message(payload.output, token=self._playback.output(payload.output))
+            if self._model._playback_mode == "discard":
+                message.audio.close()
             generation.outputs[payload.output.item_id] = message
             modalities: asyncio.Future[list[Literal["text", "audio"]]] = (
                 asyncio.get_running_loop().create_future()
@@ -927,6 +1143,12 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
             )
         elif isinstance(payload, (r.TextDelta, r.TextDone, r.AudioDelta, r.AudioDone)):
             generation = self._generations[payload.output.response.response_id]
+            if (
+                isinstance(payload, r.AudioDelta)
+                and payload.audio.data
+                and generation.first_audio_monotonic is None
+            ):
+                generation.first_audio_monotonic = time.monotonic()
             if generation.abandoned:
                 return
             message = generation.outputs[payload.output.item_id]
@@ -941,16 +1163,19 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
                 message.transcript = payload.text
                 message.text.close()
             elif isinstance(payload, r.AudioDelta):
+                if self._model._playback_mode == "discard":
+                    return
                 data = payload.audio.data
                 if data:
-                    message.audio.send_nowait(
-                        rtc.AudioFrame(
-                            data=data,
-                            sample_rate=24000,
-                            num_channels=1,
-                            samples_per_channel=len(data) // 2,
-                        )
+                    frame = rtc.AudioFrame(
+                        data=data,
+                        sample_rate=24000,
+                        num_channels=1,
+                        samples_per_channel=len(data) // 2,
                     )
+                    assert self._playback is not None
+                    self._playback.tag(message.token, frame)
+                    message.audio.send_nowait(frame)
             else:
                 message.audio.close()
         elif isinstance(payload, r.ToolCall):
@@ -962,6 +1187,14 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
             call = self._history.record_tool_call(payload)
             self._generations[payload.call.response_id].functions.send_nowait(call)
         elif isinstance(payload, r.ResponseEnded):
+            assert self._playback is not None
+            self._playback.end(
+                payload.response,
+                interrupted=(
+                    self._generations[payload.response.response_id].abandoned
+                    or payload.status != "completed"
+                ),
+            )
             instruction_item_id = self._generations[
                 payload.response.response_id
             ].instruction_item_id
@@ -972,6 +1205,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
             self._end(self._generations[payload.response.response_id])
             if self._active == payload.response:
                 self._active = None
+            self._emit_response_metrics(payload)
         elif isinstance(payload, r.ItemTruncated):
             if payload.kept_text is not None and payload.content_index == 0:
                 for generation in self._generations.values():
@@ -984,6 +1218,39 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
             self._emit_error(
                 PrismError(payload.error), recoverable=payload.error.scope != "session"
             )
+
+    def _emit_response_metrics(self, ended: r.ResponseEnded) -> None:
+        generation = self._generations[ended.response.response_id]
+        if generation.provider_ended:
+            return
+        generation.provider_ended = True
+        duration = time.monotonic() - generation.created_monotonic
+        usage = ended.usage
+        output_tokens = usage.output_tokens if usage is not None else 0
+        self.emit(
+            "metrics_collected",
+            RealtimeModelMetrics(
+                request_id=ended.response.response_id,
+                timestamp=generation.created_timestamp,
+                duration=duration,
+                ttft=(
+                    generation.first_audio_monotonic - generation.created_monotonic
+                    if generation.first_audio_monotonic is not None
+                    else -1
+                ),
+                cancelled=ended.status == "cancelled",
+                label=self._model.label,
+                input_tokens=usage.input_tokens if usage is not None else 0,
+                output_tokens=output_tokens,
+                total_tokens=usage.total_tokens if usage is not None else 0,
+                tokens_per_second=output_tokens / duration if duration > 0 else 0,
+                input_token_details=RealtimeModelMetrics.InputTokenDetails(),
+                output_token_details=RealtimeModelMetrics.OutputTokenDetails(),
+                metadata=Metadata(
+                    model_name=self._model.model, model_provider=self._model.provider
+                ),
+            ),
+        )
 
     def _end(self, generation: _Generation) -> None:
         if generation.ended:
@@ -999,7 +1266,11 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
                 transcript = message.retained_text
             if transcript or message.retained_text is not None:
                 assert self._history is not None
-                self._history.record_assistant(item_id, transcript)
+                self._history.record_assistant(item_id, message.transcript)
+                if message.played_transcript is not None:
+                    self._history.record_assistant(item_id, message.played_transcript, played=True)
+                if message.retained_text is not None:
+                    self._history.record_assistant(item_id, message.retained_text)
             message.retained_text = None
             message.text.close()
             message.audio.close()
@@ -1073,6 +1344,10 @@ class RealtimeSession(llm.RealtimeSession[Literal["rime_server_event_received"]]
 
     async def _shutdown(self) -> None:
         self._closed = True
+        if self._playback is not None:
+            self._playback.close()
+        if self._history is not None:
+            self._history.close()
         if not self._initialized.done():
             self._initialized.cancel()
         tasks = list(self._tasks)
